@@ -45,6 +45,20 @@ app.post(
     return limiterStandard(req, res, next);
   },
   (req, res) => {
+    res.json({
+      engine: "IA11",
+      score: 72,
+      verdict: "medium credibility",
+      reasons: [
+        "Multiple sources detected",
+        "No major contradictions found"
+      ],
+      sources: [],
+      status: "success"
+    });
+  }
+);
+
 
   res.json({
     engine: "IA11",

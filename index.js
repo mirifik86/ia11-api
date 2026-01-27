@@ -108,20 +108,17 @@ app.post(
       engine: "IA11",
       mode,
       result: {
-        score: 72,
-        riskLevel: "medium",
-        summary: "Mock response (engine is online and ready).",
-        reasons: [
-          "API reachable",
-          "Input received",
-          "Scoring placeholder active"
-        ],
-        confidence: 0.82,
+        score: text.length < 80 ? 45 : 85,
+        riskLevel: text.length < 80 ? "high" : "low",
+        summary: "Simple IA11 test scoring (length-based).",
+        reasons: [text.length < 80 ? "Text too short." : "Text has enough context."],
+        confidence: text.length < 80 ? 0.55 : 0.88,
+
       sources: [
-  { url: "https://example.com/source1", title: "Example source 1", publisher: "Example", trustBadge: "medium" },
-  { url: "https://example.com/source1", title: "Example source 1 (duplicate)", publisher: "Example", trustBadge: "medium" },
-  { url: "https://example.com/source2", title: "Example source 2", publisher: "Example", trustBadge: "high" }
-].filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i),
+            { url: "https://example.com/source1", title: "Example source 1", publisher: "Example", trustBadge: "medium" },
+            { url: "https://example.com/source1", title: "Example source 1 (duplicate)", publisher: "Example", trustBadge: "medium" },
+            { url: "https://example.com/source2", title: "Example source 2", publisher: "Example", trustBadge: "high" }
+          ].filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i),
 
       },
       meta: {

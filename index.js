@@ -118,7 +118,7 @@ app.post(
             { url: "https://example.com/source1", title: "Example source 1", publisher: "Example", trustBadge: "medium" },
             { url: "https://example.com/source1", title: "Example source 1 (duplicate)", publisher: "Example", trustBadge: "medium" },
             { url: "https://example.com/source2", title: "Example source 2", publisher: "Example", trustBadge: "high" }
-          ].filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i),
+              ].filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i),
 
       },
       meta: {

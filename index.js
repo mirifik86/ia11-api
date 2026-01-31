@@ -5,8 +5,17 @@
  * - Same v1 response contract (stable for LeenScore)
  * - Much smarter scoring (multi-signal + claim extraction)
  * - Language-aware output (matches UI / user language)
- * - PRO mode: real web evidence via provider (Bing by default if key present)
+ * - PRO mode: ready for real web evidence (Bing/SerpAPI later)
  * - Conservative truth assertions: never confidently claim "false" on weak evidence
+ *
+ * SECURITY / KEY HANDLING (IMPORTANT):
+ * - Accepts API key from headers:
+ *    1) x-ia11-key: <key>   (preferred)
+ *    2) x-api-key: <key>    (fallback)
+ *    3) Authorization: Bearer <key> (fallback)
+ * - Accepts server-side keys from Render env:
+ *    IA11_API_KEY  = "key1"
+ *    IA11_API_KEYS = "key1,key2,key3"  (optional rotation / multiple valid keys)
  */
 
 const express = require("express");
@@ -21,20 +30,19 @@ const ENGINE_NAME = "IA11";
 const ENGINE_VERSION = "1.3.0-beton-arme";
 
 const PORT = parseInt(process.env.PORT || "10000", 10);
-const IA11_API_KEY = (process.env.IA11_API_KEY || "").toString().trim();
 
-const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "30", 10);
-const RATE_LIMIT_PER_MIN_PRO = parseInt(process.env.RATE_LIMIT_PER_MIN_PRO || "60", 10);
+// Primary key (single)
+const IA11_API_KEY_RAW = (process.env.IA11_API_KEY || "").toString();
+// Optional multi-keys (comma separated)
+const IA11_API_KEYS_RAW = (process.env.IA11_API_KEYS || "").toString();
 
 // Optional keys for future “real web evidence”
 const BING_API_KEY = (process.env.BING_API_KEY || "").toString().trim();
 const SERPAPI_KEY = (process.env.SERPAPI_KEY || "").toString().trim();
 const PROVIDER = ((process.env.WEB_EVIDENCE_PROVIDER || "bing") + "").toLowerCase().trim();
 
-if (!IA11_API_KEY) {
-  console.error("❌ Missing env var IA11_API_KEY. Set it in Render > Environment.");
-  process.exit(1);
-}
+const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "30", 10);
+const RATE_LIMIT_PER_MIN_PRO = parseInt(process.env.RATE_LIMIT_PER_MIN_PRO || "60", 10);
 
 // --------------------------
 // App init
@@ -58,8 +66,6 @@ function safeTrim(s, max = 20000) {
 function normalizeLang(raw) {
   const x = (raw || "").toString().trim().toLowerCase();
   if (!x) return "fr";
-
-  // accept: fr, fr-CA, en, en-US, es, it, de, pt, ru, uk, ja, etc.
   const base = x.split(",")[0].trim().split(";")[0].trim().split("-")[0].trim();
   const allowed = new Set(["fr", "en", "es", "it", "de", "pt", "ru", "uk", "ja"]);
   return allowed.has(base) ? base : "fr";
@@ -140,7 +146,6 @@ function t(lang, key) {
       summary: "IA11は文章のシグナルをもとに、断定を避けつつ信頼性を推定します。",
     },
   };
-
   const d = dict[lang] || dict.fr;
   return d[key] || dict.fr[key] || key;
 }
@@ -153,13 +158,83 @@ function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
 
+function unwrapQuotes(s) {
+  const x = (s || "").toString().trim();
+  if ((x.startsWith('"') && x.endsWith('"')) || (x.startsWith("'") && x.endsWith("'"))) {
+    return x.slice(1, -1).trim();
+  }
+  return x;
+}
+
+function parseValidKeys() {
+  const keys = [];
+
+  const one = unwrapQuotes(IA11_API_KEY_RAW).trim();
+  if (one) keys.push(one);
+
+  const multiRaw = unwrapQuotes(IA11_API_KEYS_RAW);
+  if (multiRaw) {
+    multiRaw
+      .split(",")
+      .map((k) => unwrapQuotes(k).trim())
+      .filter(Boolean)
+      .forEach((k) => keys.push(k));
+  }
+
+  // de-dup
+  return Array.from(new Set(keys));
+}
+
+const VALID_KEYS = parseValidKeys();
+
+if (!VALID_KEYS.length) {
+  console.error("❌ Missing env var IA11_API_KEY (or IA11_API_KEYS). Set it in Render > Environment.");
+  process.exit(1);
+}
+
+function getProvidedKey(req) {
+  const k1 = (req.headers["x-ia11-key"] || "").toString().trim();
+  if (k1) return k1;
+
+  const k2 = (req.headers["x-api-key"] || "").toString().trim();
+  if (k2) return k2;
+
+  const auth = (req.headers["authorization"] || "").toString().trim();
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    const k3 = auth.slice(7).trim();
+    if (k3) return k3;
+  }
+
+  return "";
+}
+
+function isKeyValid(providedKey) {
+  if (!providedKey) return false;
+
+  // constant-time compare against each valid key (avoid timing leaks)
+  const p = Buffer.from(providedKey);
+  for (const k of VALID_KEYS) {
+    const kb = Buffer.from(k);
+    if (p.length !== kb.length) continue;
+    try {
+      if (crypto.timingSafeEqual(p, kb)) return true;
+    } catch (_) {
+      // ignore
+    }
+  }
+  return false;
+}
+
 function simpleClaimHints(text) {
-  // lightweight “claim” detection (non-exhaustive)
   const lines = text.split(/\n+/).map((x) => x.trim()).filter(Boolean);
   const candidates = [];
   for (const l of lines) {
     if (l.length < 18) continue;
-    if (/(est|sont|was|were|is|are|will be|sera|seront|devient|becomes|président|president|guerre|war|attaque|attack|mort|dead|élu|elected)/i.test(l)) {
+    if (
+      /(est|sont|was|were|is|are|will be|sera|seront|devient|becomes|président|president|guerre|war|attaque|attack|mort|dead|élu|elected)/i.test(
+        l
+      )
+    ) {
       candidates.push(l.slice(0, 200));
     }
     if (candidates.length >= 6) break;
@@ -176,20 +251,16 @@ function scoreSignals(text) {
   const hasQuestionMarks = /\?{2,}/.test(text);
   const looksLikeRage = /(100%|certain|jamais|toujours|prove|proof|obvious|réveillez-vous)/i.test(text);
 
-  // base
   let score = 60;
 
-  // length (too short = risk)
   if (len < 40) score -= 25;
   else if (len < 80) score -= 12;
   else if (len > 400) score += 6;
 
-  // structure
   if (text.split("\n").length >= 3) score += 4;
   if (hasNumbers) score += 3;
   if (hasUrl) score += 4;
 
-  // hype / manipulation patterns
   if (hasAllCaps) score -= 6;
   if (hasLotsOfExcl) score -= 6;
   if (hasQuestionMarks) score -= 3;
@@ -217,8 +288,10 @@ function riskFromScore(score) {
 // --------------------------
 
 function requireKey(req, res, next) {
-  const k = (req.headers["x-ia11-key"] || "").toString().trim();
-  if (!k || k !== IA11_API_KEY) {
+  const provided = getProvidedKey(req);
+  const uiLang = normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]);
+
+  if (!isKeyValid(provided)) {
     return res.status(401).json({
       status: "error",
       requestId: newRequestId(),
@@ -227,7 +300,7 @@ function requireKey(req, res, next) {
       result: {
         score: 5,
         riskLevel: "high",
-        summary: t(normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]), "invalidKey"),
+        summary: t(uiLang, "invalidKey"),
         reasons: [],
         confidence: 0.2,
         sources: [],
@@ -235,6 +308,7 @@ function requireKey(req, res, next) {
       meta: { tookMs: 0, version: ENGINE_VERSION },
     });
   }
+
   next();
 }
 
@@ -245,13 +319,11 @@ function requireKey(req, res, next) {
 const rateStore = new Map();
 
 function getClientId(req) {
-  // allow a stable client id from header if you want (e.g., device id)
   const rawKey = (req.headers["x-client-id"] || "").toString().trim();
   if (rawKey) {
     return "cid:" + crypto.createHash("sha256").update(rawKey).digest("hex").slice(0, 16);
   }
 
-  // Fallback to real client IP (trust proxy enabled)
   const xff = (req.headers["x-forwarded-for"] || "").toString();
   const ipFromXff = xff.split(",")[0].trim();
   const ip = ipFromXff || req.ip || "unknown";
@@ -320,7 +392,8 @@ app.get("/v1/analyze", (req, res) => {
     status: "ok",
     engine: ENGINE_NAME,
     version: ENGINE_VERSION,
-    hint: "Use POST /v1/analyze with header x-ia11-key and JSON { text }",
+    hint: "Use POST /v1/analyze with header x-ia11-key (preferred) and JSON { text }",
+    authAccepted: ["x-ia11-key", "x-api-key", "authorization: bearer <key>"],
   });
 });
 
@@ -331,6 +404,7 @@ app.post("/v1/analyze", requireKey, rateLimitMiddleware, async (req, res) => {
   const uiLang = normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]);
 
   const rawText = safeTrim(req.body && req.body.text, 20000);
+
   if (!rawText) {
     return res.status(400).json({
       status: "error",
@@ -367,23 +441,17 @@ app.post("/v1/analyze", requireKey, rateLimitMiddleware, async (req, res) => {
     });
   }
 
-  // --- Core logic (your “this morning” intent preserved: multi-signal + claims + conservative)
   const requestId = newRequestId();
   const claims = simpleClaimHints(rawText);
   const signals = scoreSignals(rawText);
 
-  // Conservative confidence: increase slightly for better text signals
   let confidence = 0.6;
   if (signals.score >= 80) confidence = 0.86;
   else if (signals.score >= 55) confidence = 0.72;
   else confidence = 0.58;
 
-  // Sources: keep empty unless PRO + provider key present (future hook)
   const sources = [];
   const proMode = tier === "pro" || tier === "premium" || tier === "premium_plus";
-
-  // NOTE: This keeps your architecture ready for real evidence without breaking deploy.
-  // If you later want, we can plug Bing/SerpAPI fetch here safely.
 
   const result = {
     score: signals.score,
@@ -416,4 +484,5 @@ app.post("/v1/analyze", requireKey, rateLimitMiddleware, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✅ IA11 API running on port ${PORT} (${ENGINE_NAME} ${ENGINE_VERSION})`);
+  console.log(`🔐 IA11 keys loaded: ${VALID_KEYS.length} key(s)`);
 });

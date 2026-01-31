@@ -9,9 +9,10 @@
  * - Conservative truth assertions: never confidently claim "false" on weak evidence
  */
 
-import express from "express";
-import cors from "cors";
-import crypto from "crypto";
+const express = require("express");
+const cors = require("cors");
+const rateLimit = require("express-rate-limit");
+
 
 // --------------------------
 // Env

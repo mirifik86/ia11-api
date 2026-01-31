@@ -1,392 +1,432 @@
 /**
- * IA11 API (LeenScore) — index.js (Ultra PRO, "living" analysis)
+ * IA11 - Credibility Intelligence Engine (LeenScore)
+ * Single-file production server (Node/Express) for Render.
  *
- * Promise:
- * - Same v1 response contract (stable for LeenScore)
- * - Much smarter scoring (multi-signal + claim extraction)
- * - Language-aware output (matches UI / user language)
- * - PRO mode: ready for real web evidence (Bing/SerpAPI later)
- * - Conservative truth assertions: never confidently claim "false" on weak evidence
+ * ENV required:
+ * - IA11_API_KEY="your_primary_key"
+ * Optional:
+ * - IA11_API_KEYS="key1,key2,key3"  (comma-separated)
+ * - RATE_LIMIT_PER_MIN="30"
+ * - RATE_LIMIT_PER_MIN_PRO="60"
+ * - ENGINE_VERSION="1.3.1-pro-compatible"
+ * - WEB_EVIDENCE_PROVIDER="bing" (default "bing")
+ * - BING_API_KEY="..." (for PRO web evidence)
+ * - BING_ENDPOINT="https://api.bing.microsoft.com/v7.0/search"
  *
- * SECURITY / KEY HANDLING (IMPORTANT):
- * - Accepts API key from headers:
- *    1) x-ia11-key: <key>   (preferred)
- *    2) x-api-key: <key>    (fallback)
- *    3) Authorization: Bearer <key> (fallback)
- * - Accepts server-side keys from Render env:
- *    IA11_API_KEY  = "key1"
- *    IA11_API_KEYS = "key1,key2,key3"  (optional rotation / multiple valid keys)
+ * Headers accepted:
+ * - x-ia11-key: <key> (required)
+ * - x-ui-lang: fr|en|... (optional)
+ * - x-tier: standard|pro (optional)
+ *
+ * Body accepted:
+ * - { text: "...", language: "fr", analysisType: "standard"|"pro" }
+ * - or { content: "..." } (alias)
  */
 
-const express = require("express");
-const cors = require("cors");
-const crypto = require("crypto");
-
-// --------------------------
-// Env
-// --------------------------
-
-const ENGINE_NAME = "IA11";
-const ENGINE_VERSION = "1.3.0-beton-arme";
-
-const PORT = parseInt(process.env.PORT || "10000", 10);
-
-// Primary key (single)
-const IA11_API_KEY_RAW = (process.env.IA11_API_KEY || "").toString();
-// Optional multi-keys (comma separated)
-const IA11_API_KEYS_RAW = (process.env.IA11_API_KEYS || "").toString();
-console.log("IA11_API_KEY_RAW length:", IA11_API_KEY_RAW.length);
-console.log("IA11_API_KEYS_RAW length:", IA11_API_KEYS_RAW.length);
-
-
-// Optional keys for future “real web evidence”
-const BING_API_KEY = (process.env.BING_API_KEY || "").toString().trim();
-const SERPAPI_KEY = (process.env.SERPAPI_KEY || "").toString().trim();
-const PROVIDER = ((process.env.WEB_EVIDENCE_PROVIDER || "bing") + "").toLowerCase().trim();
-
-const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "30", 10);
-const RATE_LIMIT_PER_MIN_PRO = parseInt(process.env.RATE_LIMIT_PER_MIN_PRO || "60", 10);
-
-// --------------------------
-// App init
-// --------------------------
+import express from "express";
+import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
-app.set("trust proxy", true);
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// --------------------------
-// Helpers
-// --------------------------
+// ---- Engine identity
+const ENGINE_NAME = "IA11";
+const ENGINE_VERSION = (process.env.ENGINE_VERSION || "1.3.0-pro-compatible").toString().trim();
+const PORT = parseInt(process.env.PORT || "10000", 10);
 
-function safeTrim(s, max = 20000) {
-  const t = (s || "").toString().trim();
-  if (t.length <= max) return t;
-  return t.slice(0, max);
-}
+// ---- Auth keys (trimmed)
+const IA11_API_KEY_RAW = (process.env.IA11_API_KEY || "").toString().trim();
+const IA11_API_KEYS_RAW = (process.env.IA11_API_KEYS || "").toString().trim();
 
-function normalizeLang(raw) {
-  const x = (raw || "").toString().trim().toLowerCase();
-  if (!x) return "fr";
-  const base = x.split(",")[0].trim().split(";")[0].trim().split("-")[0].trim();
-  const allowed = new Set(["fr", "en", "es", "it", "de", "pt", "ru", "uk", "ja"]);
-  return allowed.has(base) ? base : "fr";
-}
+// ---- Rate limits
+const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "30", 10);
+const RATE_LIMIT_PER_MIN_PRO = parseInt(process.env.RATE_LIMIT_PER_MIN_PRO || "60", 10);
 
-function t(lang, key) {
-  const dict = {
-    fr: {
-      ok: "OK",
-      missingText: "Texte manquant.",
-      tooShort: "Texte trop court pour être analysé.",
-      invalidKey: "Clé API invalide.",
-      rateLimited: "Trop de requêtes. Réessaie dans une minute.",
-      summary: "Estimation de crédibilité IA11 basée sur signaux du texte et prudence sur les affirmations.",
-    },
-    en: {
-      ok: "OK",
-      missingText: "Missing text.",
-      tooShort: "Text too short to analyze.",
-      invalidKey: "Invalid API key.",
-      rateLimited: "Too many requests. Try again in a minute.",
-      summary: "IA11 credibility estimate based on text signals and conservative truth assertions.",
-    },
-    es: {
-      ok: "OK",
-      missingText: "Falta el texto.",
-      tooShort: "Texto demasiado corto para analizar.",
-      invalidKey: "Clave API inválida.",
-      rateLimited: "Demasiadas solicitudes. Intenta de nuevo en un minuto.",
-      summary: "Estimación de credibilidad IA11 basada en señales del texto y prudencia con las afirmaciones.",
-    },
-    it: {
-      ok: "OK",
-      missingText: "Testo mancante.",
-      tooShort: "Testo troppo corto per essere analizzato.",
-      invalidKey: "Chiave API non valida.",
-      rateLimited: "Troppe richieste. Riprova tra un minuto.",
-      summary: "Stima di credibilità IA11 basata su segnali del testo e prudenza sulle affermazioni.",
-    },
-    de: {
-      ok: "OK",
-      missingText: "Text fehlt.",
-      tooShort: "Text zu kurz zur Analyse.",
-      invalidKey: "Ungültiger API-Schlüssel.",
-      rateLimited: "Zu viele Anfragen. Versuche es in einer Minute erneut.",
-      summary: "IA11-Glaubwürdigkeits-Schätzung basierend auf Textsignalen und konservativen Aussagen.",
-    },
-    pt: {
-      ok: "OK",
-      missingText: "Texto ausente.",
-      tooShort: "Texto muito curto para analisar.",
-      invalidKey: "Chave de API inválida.",
-      rateLimited: "Muitas solicitações. Tente novamente em um minuto.",
-      summary: "Estimativa de credibilidade IA11 baseada em sinais do texto e prudência nas afirmações.",
-    },
-    ru: {
-      ok: "ОК",
-      missingText: "Текст отсутствует.",
-      tooShort: "Текст слишком короткий для анализа.",
-      invalidKey: "Неверный API-ключ.",
-      rateLimited: "Слишком много запросов. Попробуйте через минуту.",
-      summary: "Оценка достоверности IA11 на основе сигналов текста и осторожности в выводах.",
-    },
-    uk: {
-      ok: "ОК",
-      missingText: "Текст відсутній.",
-      tooShort: "Текст занадто короткий для аналізу.",
-      invalidKey: "Недійсний API-ключ.",
-      rateLimited: "Забагато запитів. Спробуйте за хвилину.",
-      summary: "Оцінка достовірності IA11 на основі сигналів тексту та обережності у висновках.",
-    },
-    ja: {
-      ok: "OK",
-      missingText: "テキストがありません。",
-      tooShort: "分析するにはテキストが短すぎます。",
-      invalidKey: "APIキーが無効です。",
-      rateLimited: "リクエストが多すぎます。1分後に再試行してください。",
-      summary: "IA11は文章のシグナルをもとに、断定を避けつつ信頼性を推定します。",
-    },
-  };
-  const d = dict[lang] || dict.fr;
-  return d[key] || dict.fr[key] || key;
+// ---- Web evidence (optional, PRO)
+const WEB_EVIDENCE_PROVIDER = ((process.env.WEB_EVIDENCE_PROVIDER || "bing") + "").toLowerCase().trim();
+const BING_API_KEY = (process.env.BING_API_KEY || "").toString().trim();
+const BING_ENDPOINT = (process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search").toString().trim();
+
+// ---- Key set
+const allowedKeys = new Set(
+  [
+    IA11_API_KEY_RAW,
+    ...IA11_API_KEYS_RAW.split(",").map((s) => s.trim()).filter(Boolean),
+  ].filter(Boolean)
+);
+
+// ---- Simple in-memory rate limiter (per key)
+const buckets = new Map(); // key -> { windowStartMs, count, countPro }
+
+function nowMs() {
+  return Date.now();
 }
 
 function newRequestId() {
   return crypto.randomBytes(12).toString("hex");
 }
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function unwrapQuotes(s) {
-  const x = (s || "").toString().trim();
-  if ((x.startsWith('"') && x.endsWith('"')) || (x.startsWith("'") && x.endsWith("'"))) {
-    return x.slice(1, -1).trim();
-  }
-  return x;
+function safeStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v);
 }
 
-function parseValidKeys() {
-  const keys = [];
-
-  const one = unwrapQuotes(IA11_API_KEY_RAW).trim();
-  if (one) keys.push(one);
-
-  const multiRaw = unwrapQuotes(IA11_API_KEYS_RAW);
-  if (multiRaw) {
-    multiRaw
-      .split(",")
-      .map((k) => unwrapQuotes(k).trim())
-      .filter(Boolean)
-      .forEach((k) => keys.push(k));
-  }
-
-  // de-dup
-  return Array.from(new Set(keys));
+function detectLang(bodyLang, headerLang) {
+  const raw = (bodyLang || headerLang || "en").toString().toLowerCase().trim();
+  if (!raw) return "en";
+  // Keep anything but normalize common
+  if (raw.startsWith("fr")) return "fr";
+  if (raw.startsWith("en")) return "en";
+  return raw;
 }
 
-const VALID_KEYS = parseValidKeys();
-
-if (!VALID_KEYS.length) {
-  console.error("❌ Missing env var IA11_API_KEY (or IA11_API_KEYS). Set it in Render > Environment.");
-  process.exit(1);
+function detectMode(bodyType, headerTier) {
+  const raw = (bodyType || headerTier || "standard").toString().toLowerCase().trim();
+  if (raw === "pro" || raw === "premium" || raw === "premium_plus") return "pro";
+  return "standard";
 }
 
-function getProvidedKey(req) {
-  const k1 = (req.headers["x-ia11-key"] || "").toString().trim();
-  if (k1) return k1;
+function authAndRateLimit(req) {
+  const incoming = safeStr(req.headers["x-ia11-key"]).trim();
+  const tier = safeStr(req.headers["x-tier"]).toLowerCase().trim();
+  const mode = detectMode(req.body?.analysisType, tier);
 
-  const k2 = (req.headers["x-api-key"] || "").toString().trim();
-  if (k2) return k2;
-
-  const auth = (req.headers["authorization"] || "").toString().trim();
-  if (auth.toLowerCase().startsWith("bearer ")) {
-    const k3 = auth.slice(7).trim();
-    if (k3) return k3;
+  if (!incoming || !allowedKeys.has(incoming)) {
+    return { ok: false, status: 401, error: "Clé API invalide." };
   }
 
-  return "";
-}
+  const key = incoming;
+  const limit = mode === "pro" ? RATE_LIMIT_PER_MIN_PRO : RATE_LIMIT_PER_MIN;
 
-function isKeyValid(providedKey) {
-  if (!providedKey) return false;
+  const t = nowMs();
+  const windowMs = 60_000;
+  const bucket = buckets.get(key) || { windowStartMs: t, count: 0, countPro: 0 };
 
-  // constant-time compare against each valid key (avoid timing leaks)
-  const p = Buffer.from(providedKey);
-  for (const k of VALID_KEYS) {
-    const kb = Buffer.from(k);
-    if (p.length !== kb.length) continue;
-    try {
-      if (crypto.timingSafeEqual(p, kb)) return true;
-    } catch (_) {
-      // ignore
-    }
+  if (t - bucket.windowStartMs >= windowMs) {
+    bucket.windowStartMs = t;
+    bucket.count = 0;
+    bucket.countPro = 0;
   }
-  return false;
+
+  if (mode === "pro") bucket.countPro += 1;
+  else bucket.count += 1;
+
+  const used = mode === "pro" ? bucket.countPro : bucket.count;
+
+  buckets.set(key, bucket);
+
+  if (used > limit) {
+    return { ok: false, status: 429, error: "Trop de requêtes. Réessayez dans une minute." };
+  }
+
+  return { ok: true, mode };
 }
 
-function simpleClaimHints(text) {
-  const lines = text.split(/\n+/).map((x) => x.trim()).filter(Boolean);
-  const candidates = [];
-  for (const l of lines) {
-    if (l.length < 18) continue;
-    if (
-      /(est|sont|was|were|is|are|will be|sera|seront|devient|becomes|président|president|guerre|war|attaque|attack|mort|dead|élu|elected)/i.test(
-        l
-      )
-    ) {
-      candidates.push(l.slice(0, 200));
-    }
-    if (candidates.length >= 6) break;
-  }
-  return candidates;
-}
+// -----------------------------
+// Scoring + PRO logic (Lovable-compatible outputs)
+// -----------------------------
 
 function scoreSignals(text) {
-  const len = text.length;
-  const hasUrl = /(https?:\/\/|www\.)/i.test(text);
-  const hasNumbers = /\d/.test(text);
-  const hasAllCaps = /[A-Z]{10,}/.test(text);
-  const hasLotsOfExcl = /!{3,}/.test(text);
-  const hasQuestionMarks = /\?{2,}/.test(text);
-  const looksLikeRage = /(100%|certain|jamais|toujours|prove|proof|obvious|réveillez-vous)/i.test(text);
+  const t = text.trim();
+  const lower = t.toLowerCase();
 
-  let score = 60;
+  const length = t.length;
+  const hasUrl = /(https?:\/\/|www\.)/i.test(t);
+  const hasNumbers = /\d/.test(t);
+  const hasDateLike = /\b(19|20)\d{2}\b/.test(t) || /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(t);
+  const hasProperNames = /\b[A-Z][a-z]{2,}\b/.test(t); // weak proxy
+  const hasQuotes = /["“”«»]/.test(t);
+  const hasQuestion = /\?/.test(t);
 
-  if (len < 40) score -= 25;
-  else if (len < 80) score -= 12;
-  else if (len > 400) score += 6;
+  const sensational = /\b(choc|incroyable|scandale|honteux|100%|preuve absolue|tout le monde sait|on nous cache|complot)\b/i.test(lower);
+  const hedging = /\b(peut-?être|probablement|il semble|selon|d'après|aurait|pourrait|serait)\b/i.test(lower);
 
-  if (text.split("\n").length >= 3) score += 4;
-  if (hasNumbers) score += 3;
-  if (hasUrl) score += 4;
+  // simple citation cues
+  const citesSourceWords = /\b(source|référence|rapport|étude|communiqué|document|article)\b/i.test(lower);
 
-  if (hasAllCaps) score -= 6;
-  if (hasLotsOfExcl) score -= 6;
-  if (hasQuestionMarks) score -= 3;
-  if (looksLikeRage) score -= 6;
+  // Basic “claim structure”: short, absolute claims are riskier
+  const isVeryShort = length < 40;
+  const isShort = length < 90;
 
-  score = clamp(score, 5, 98);
+  // Build points by dimensions (Lovable UI expects breakdown categories)
+  const breakdown = {
+    sources: { points: 0, reason: "" },
+    factual: { points: 0, reason: "" },
+    tone: { points: 0, reason: "" },
+    context: { points: 0, reason: "" },
+    transparency: { points: 0, reason: "" },
+  };
 
+  // SOURCES
+  let sourcesPts = 0;
+  if (hasUrl) sourcesPts += 18;
+  if (citesSourceWords) sourcesPts += 10;
+  if (!hasUrl && !citesSourceWords) sourcesPts -= 8;
+  breakdown.sources.points = clamp(sourcesPts, -20, 25);
+  breakdown.sources.reason =
+    hasUrl || citesSourceWords
+      ? "Présence d’indices de sources (liens / références)."
+      : "Aucun indice clair de source ou de référence externe.";
+
+  // FACTUAL
+  let factualPts = 0;
+  if (hasNumbers) factualPts += 8;
+  if (hasDateLike) factualPts += 8;
+  if (hasProperNames) factualPts += 6;
+  if (isVeryShort) factualPts -= 10;
+  if (isShort) factualPts -= 4;
+  breakdown.factual.points = clamp(factualPts, -20, 25);
+  breakdown.factual.reason =
+    factualPts >= 10
+      ? "Le texte contient des détails vérifiables (noms/dates/chiffres)."
+      : "Peu de détails vérifiables; l’affirmation est difficile à confirmer.";
+
+  // TONE / PRUDENCE
+  let tonePts = 0;
+  if (sensational) tonePts -= 18;
+  if (hedging) tonePts += 10;
+  if (hasQuestion) tonePts += 4;
+  breakdown.tone.points = clamp(tonePts, -25, 20);
+  breakdown.tone.reason =
+    sensational
+      ? "Tonalité sensationnaliste ou absolue (augmente le risque)."
+      : hedging
+        ? "Formulation prudente (réduit le risque d’affirmation catégorique)."
+        : "Tonalité neutre.";
+
+  // CONTEXT
+  let contextPts = 0;
+  if (length >= 220) contextPts += 10;
+  if (length >= 500) contextPts += 10;
+  if (isVeryShort) contextPts -= 12;
+  breakdown.context.points = clamp(contextPts, -20, 20);
+  breakdown.context.reason =
+    contextPts > 0 ? "Contexte suffisant pour interpréter l’affirmation." : "Contexte limité.";
+
+  // TRANSPARENCY (how clear the claim is)
+  let transpPts = 0;
+  if (hasQuotes) transpPts += 6;
+  if (hasUrl) transpPts += 6;
+  if (sensational) transpPts -= 6;
+  breakdown.transparency.points = clamp(transpPts, -15, 15);
+  breakdown.transparency.reason =
+    hasUrl || hasQuotes
+      ? "Certaines indications facilitent la traçabilité (liens / citations)."
+      : "Peu d’indices de traçabilité (pas de lien, citation ou référence).";
+
+  // Aggregate score
+  const base = 55;
+  const sum =
+    breakdown.sources.points +
+    breakdown.factual.points +
+    breakdown.tone.points +
+    breakdown.context.points +
+    breakdown.transparency.points;
+
+  let score = clamp(base + sum, 5, 98);
+
+  // Risk level from score
+  const riskLevel = score >= 75 ? "low" : score >= 50 ? "medium" : "high";
+
+  // Confidence (0..1) - heuristic
+  let confidence = 0.45;
+  if (hasUrl) confidence += 0.15;
+  if (hasDateLike || hasNumbers) confidence += 0.08;
+  if (sensational) confidence -= 0.12;
+  if (isVeryShort) confidence -= 0.10;
+  confidence = clamp(confidence, 0.2, 0.92);
+
+  // Reasons array (Lovable UI shows "reasons")
   const reasons = [];
-  reasons.push(len < 80 ? "Texte court: prudence accrue" : "Longueur de texte suffisante");
-  if (hasUrl) reasons.push("Présence de lien(s): meilleur contexte potentiel");
-  if (hasNumbers) reasons.push("Présence de chiffres: signal de précision (à vérifier)");
-  if (hasAllCaps || hasLotsOfExcl || looksLikeRage) reasons.push("Signaux de ton émotionnel / persuasion détectés");
+  if (!hasUrl && !citesSourceWords) reasons.push("Aucune source ou référence externe explicite n’est fournie.");
+  if (sensational) reasons.push("Le texte contient des formulations sensationnalistes ou absolues.");
+  if (isVeryShort) reasons.push("Le texte est très court, donc difficile à vérifier ou contextualiser.");
+  if (hasDateLike || hasNumbers || hasProperNames) reasons.push("Le texte contient des éléments potentiellement vérifiables (noms/dates/chiffres).");
+  if (hedging) reasons.push("La formulation reste prudente (conditionnel / incertitude).");
 
-  return { score, reasons };
+  if (reasons.length === 0) reasons.push("Analyse basée sur les signaux textuels disponibles.");
+
+  return { score, riskLevel, confidence, reasons, breakdown };
 }
 
-function riskFromScore(score) {
-  if (score >= 80) return "low";
-  if (score >= 55) return "medium";
-  return "high";
-}
+// --- Web evidence (PRO). Bing search -> simple stance scoring.
+// If no API key configured, returns "limited coverage".
+async function fetchBingEvidence(query, max = 5, timeoutMs = 6000) {
+  if (!BING_API_KEY) return { ok: false, reason: "no_bing_key", items: [] };
 
-// --------------------------
-// API key middleware
-// --------------------------
+  const url = new URL(BING_ENDPOINT);
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(max));
+  url.searchParams.set("mkt", "en-US"); // keep deterministic; UI can translate later if needed
+  url.searchParams.set("safeSearch", "Moderate");
 
-function requireKey(req, res, next) {
-  const provided = getProvidedKey(req);
-  const uiLang = normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!isKeyValid(provided)) {
-    return res.status(401).json({
-      status: "error",
-      requestId: newRequestId(),
-      engine: ENGINE_NAME,
-      mode: "standard",
-      result: {
-        score: 5,
-        riskLevel: "high",
-        summary: t(uiLang, "invalidKey"),
-        reasons: [],
-        confidence: 0.2,
-        sources: [],
-      },
-      meta: { tookMs: 0, version: ENGINE_VERSION },
+  try {
+    const res = await fetch(url.toString(), {
+      method: "GET",
+      headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
+      signal: controller.signal,
     });
+    if (!res.ok) return { ok: false, reason: `bing_http_${res.status}`, items: [] };
+    const data = await res.json();
+    const webPages = data?.webPages?.value || [];
+    const items = webPages
+      .map((v) => ({
+        title: safeStr(v.name),
+        url: safeStr(v.url),
+        snippet: safeStr(v.snippet),
+        provider: "bing",
+      }))
+      .filter((x) => x.url);
+    return { ok: true, items };
+  } catch (e) {
+    return { ok: false, reason: "bing_error", items: [] };
+  } finally {
+    clearTimeout(timer);
   }
-
-  next();
 }
 
-// --------------------------
-// In-memory rate limit (per client + tier)
-// --------------------------
+function buildEvidenceSummary(items, claimText) {
+  // Very lightweight stance: if snippet contains “false/hoax/not true” vs overlap keywords
+  const claim = claimText.toLowerCase();
+  const tokens = claim
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4)
+    .slice(0, 18);
 
-const rateStore = new Map();
+  const negCues = ["false", "hoax", "not true", "debunk", "misleading", "fake", "rumor", "rumeur", "faux", "démenti"];
+  const posCues = ["confirmed", "official", "announced", "report", "statement", "communiqué", "rapport", "confirmé"];
 
-function getClientId(req) {
-  const rawKey = (req.headers["x-client-id"] || "").toString().trim();
-  if (rawKey) {
-    return "cid:" + crypto.createHash("sha256").update(rawKey).digest("hex").slice(0, 16);
-  }
+  let corroborates = 0;
+  let contradicts = 0;
 
-  const xff = (req.headers["x-forwarded-for"] || "").toString();
-  const ipFromXff = xff.split(",")[0].trim();
-  const ip = ipFromXff || req.ip || "unknown";
-  return "ip:" + ip;
+  const sources = items.map((it) => {
+    const s = (it.snippet || "").toLowerCase();
+    const hasNeg = negCues.some((c) => s.includes(c));
+    const hasPos = posCues.some((c) => s.includes(c));
+    const overlap = tokens.reduce((acc, t) => (s.includes(t) ? acc + 1 : acc), 0);
+
+    let stance = "context";
+    if (hasNeg && !hasPos) stance = "contradicts";
+    else if (hasPos && !hasNeg) stance = "corroborates";
+    else if (overlap >= 3) stance = "corroborates"; // weak support
+
+    if (stance === "corroborates") corroborates += 1;
+    if (stance === "contradicts") contradicts += 1;
+
+    // reliability heuristic: prefer known domains? (very light)
+    const reliability =
+      /(\.gov|\.edu|who\.int|un\.org|oecd\.org|europa\.eu)/i.test(it.url) ? "high" : overlap >= 3 ? "medium" : "low";
+
+    return {
+      title: it.title || it.url,
+      url: it.url,
+      provider: it.provider || WEB_EVIDENCE_PROVIDER,
+      stance,
+      reliability,
+    };
+  });
+
+  let outcome = "uncertain";
+  if (corroborates >= 2 && contradicts === 0) outcome = "confirmed";
+  if (contradicts >= 1 && corroborates === 0) outcome = "contradicted";
+  if (contradicts >= 1 && corroborates >= 1) outcome = "mixed";
+
+  const summary =
+    outcome === "confirmed"
+      ? "Des sources externes semblent corroborer l’affirmation."
+      : outcome === "contradicted"
+        ? "Des sources externes semblent contredire l’affirmation."
+        : outcome === "mixed"
+          ? "Les sources externes sont partagées (corroborations et contradictions)."
+          : "Aucune confirmation externe forte n’a été identifiée.";
+
+  const bestLinks = sources
+    .filter((s) => s.reliability !== "low")
+    .slice(0, 4)
+    .map((s) => ({ title: s.title, url: s.url, stance: s.stance, reliability: s.reliability }));
+
+  return {
+    corroboration: {
+      outcome,
+      sourcesConsulted: sources.length,
+      sourceTypes: Array.from(new Set(sources.map((s) => s.provider))).filter(Boolean),
+      summary,
+    },
+    sources,
+    bestLinks,
+    stats: { corroborates, contradicts },
+  };
 }
 
-function rateLimitMiddleware(req, res, next) {
-  const tier = (req.headers["x-tier"] || "standard").toString().toLowerCase();
-  const limit =
-    tier === "pro" || tier === "premium" || tier === "premium_plus"
-      ? RATE_LIMIT_PER_MIN_PRO
-      : RATE_LIMIT_PER_MIN;
+function buildSummary(lang, mode, score, riskLevel, corroboration) {
+  // Keep it short; UI can show long “PRO explanation” elsewhere
+  const fr = {
+    low: "Crédibilité élevée : signaux cohérents et risque faible.",
+    medium: "Crédibilité moyenne : certains signaux sont solides, mais prudence recommandée.",
+    high: "Crédibilité faible : manque de preuves ou signaux à risque.",
+  };
+  const en = {
+    low: "High credibility: coherent signals and low risk.",
+    medium: "Moderate credibility: some strong signals, but caution is recommended.",
+    high: "Low credibility: limited evidence or higher-risk signals.",
+  };
 
-  const clientId = getClientId(req);
-  const key = `${clientId}:${tier}`;
-  const now = Date.now();
-  const windowMs = 60_000;
+  const base = lang.startsWith("fr") ? fr[riskLevel] : en[riskLevel];
 
-  const entry = rateStore.get(key) || { count: 0, resetAt: now + windowMs };
-
-  if (now > entry.resetAt) {
-    entry.count = 0;
-    entry.resetAt = now + windowMs;
+  if (mode === "pro" && corroboration?.outcome) {
+    const extraFR =
+      corroboration.outcome === "confirmed"
+        ? " Des confirmations externes existent."
+        : corroboration.outcome === "contradicted"
+          ? " Des contradictions externes existent."
+          : corroboration.outcome === "mixed"
+            ? " Les sources externes sont partagées."
+            : " Confirmation externe limitée.";
+    const extraEN =
+      corroboration.outcome === "confirmed"
+        ? " External confirmations exist."
+        : corroboration.outcome === "contradicted"
+          ? " External contradictions exist."
+          : corroboration.outcome === "mixed"
+            ? " External sources are mixed."
+            : " Limited external confirmation.";
+    return base + (lang.startsWith("fr") ? extraFR : extraEN);
   }
 
-  entry.count += 1;
-  rateStore.set(key, entry);
-
-  if (entry.count > limit) {
-    const lang = normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]);
-    return res.status(429).json({
-      status: "error",
-      requestId: newRequestId(),
-      engine: ENGINE_NAME,
-      mode: tier,
-      result: {
-        score: 5,
-        riskLevel: "high",
-        summary: t(lang, "rateLimited"),
-        reasons: [],
-        confidence: 0.2,
-        sources: [],
-      },
-      meta: { tookMs: 0, version: ENGINE_VERSION },
-    });
-  }
-
-  next();
+  return base;
 }
 
-// --------------------------
+function buildArticleSummary(lang, mode, corroboration) {
+  // This is what your UI labels as "Explication PRO" / "articleSummary" often
+  if (mode !== "pro") return "";
+  if (lang.startsWith("fr")) {
+    return "Estimation de la crédibilité par IA11 basée sur les signaux textuels et une vérification externe lorsque disponible.";
+  }
+  return "Credibility estimate by IA11 based on textual signals and external verification when available.";
+}
+
+// -----------------------------
 // Routes
-// --------------------------
+// -----------------------------
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     engine: ENGINE_NAME,
     version: ENGINE_VERSION,
-    time: new Date().toISOString(),
+    message: "IA11 online",
   });
 });
 
@@ -395,97 +435,155 @@ app.get("/v1/analyze", (req, res) => {
     status: "ok",
     engine: ENGINE_NAME,
     version: ENGINE_VERSION,
-    hint: "Use POST /v1/analyze with header x-ia11-key (preferred) and JSON { text }",
-    authAccepted: ["x-ia11-key", "x-api-key", "authorization: bearer <key>"],
+    usage: "POST /v1/analyze { text|content, language?, analysisType? } with header x-ia11-key",
   });
 });
 
-app.post("/v1/analyze", requireKey, rateLimitMiddleware, async (req, res) => {
-  const started = Date.now();
+app.post("/v1/analyze", async (req, res) => {
+  const t0 = nowMs();
+  const requestId = newRequestId();
 
-  const tier = (req.headers["x-tier"] || "standard").toString().toLowerCase();
-  const uiLang = normalizeLang(req.headers["x-ui-lang"] || req.headers["accept-language"]);
-
-  const rawText = safeTrim(req.body && req.body.text, 20000);
-
-  if (!rawText) {
-    return res.status(400).json({
+  // Auth + rate limit
+  const gate = authAndRateLimit(req);
+  if (!gate.ok) {
+    return res.status(gate.status).json({
       status: "error",
-      requestId: newRequestId(),
+      requestId,
       engine: ENGINE_NAME,
-      mode: tier,
+      mode: "standard",
       result: {
         score: 5,
         riskLevel: "high",
-        summary: t(uiLang, "missingText"),
+        summary: gate.error,
         reasons: [],
         confidence: 0.2,
         sources: [],
       },
-      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
+      meta: { tookMs: nowMs() - t0, version: ENGINE_VERSION },
     });
   }
 
-  if (rawText.length < 12) {
+  const mode = gate.mode;
+
+  // Input
+  const text = safeStr(req.body?.text || req.body?.content || "").trim();
+  const lang = detectLang(req.body?.language, req.headers["x-ui-lang"]);
+
+  if (!text) {
     return res.status(400).json({
       status: "error",
-      requestId: newRequestId(),
+      requestId,
       engine: ENGINE_NAME,
-      mode: tier,
+      mode,
       result: {
-        score: 8,
+        score: 5,
         riskLevel: "high",
-        summary: t(uiLang, "tooShort"),
+        summary: lang.startsWith("fr") ? "Texte manquant." : "Missing text.",
         reasons: [],
-        confidence: 0.25,
+        confidence: 0.2,
         sources: [],
       },
-      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
+      meta: { tookMs: nowMs() - t0, version: ENGINE_VERSION },
     });
   }
 
-  const requestId = newRequestId();
-  const claims = simpleClaimHints(rawText);
-  const signals = scoreSignals(rawText);
+  // Text-only scoring (base)
+  const base = scoreSignals(text);
 
-  let confidence = 0.6;
-  if (signals.score >= 80) confidence = 0.86;
-  else if (signals.score >= 55) confidence = 0.72;
-  else confidence = 0.58;
+  // PRO evidence (optional)
+  let corroboration = { outcome: "uncertain", sourcesConsulted: 0, sourceTypes: [], summary: "" };
+  let sources = [];
+  let bestLinks = [];
+  let coverage = { webCoverage: "limited", sourceDiversity: "low", contradictionsCheck: "not_run" };
 
-  const sources = [];
-  const proMode = tier === "pro" || tier === "premium" || tier === "premium_plus";
+  if (mode === "pro") {
+    // Use a simple query: first 140 chars without URLs
+    const q = text.replace(/https?:\/\/\S+/g, "").slice(0, 140).trim();
+    if (WEB_EVIDENCE_PROVIDER === "bing" && BING_API_KEY) {
+      const ev = await fetchBingEvidence(q, 5);
+      if (ev.ok && ev.items.length) {
+        const built = buildEvidenceSummary(ev.items, text);
+        corroboration = built.corroboration;
+        sources = built.sources;
+        bestLinks = built.bestLinks;
+        coverage = {
+          webCoverage: "limited", // still limited because we only do top results
+          sourceDiversity: built.corroboration.sourceTypes.length >= 2 ? "medium" : "low",
+          contradictionsCheck: built.stats.contradicts > 0 ? "found" : "none_found",
+        };
+      } else {
+        corroboration = {
+          outcome: "uncertain",
+          sourcesConsulted: 0,
+          sourceTypes: [],
+          summary: lang.startsWith("fr")
+            ? "Vérification web indisponible (clé manquante ou requête impossible)."
+            : "Web verification unavailable (missing key or request failed).",
+        };
+      }
+    } else {
+      corroboration = {
+        outcome: "uncertain",
+        sourcesConsulted: 0,
+        sourceTypes: [],
+        summary: lang.startsWith("fr")
+          ? "Couverture web limitée (aucune clé de recherche configurée)."
+          : "Limited web coverage (no search key configured).",
+      };
+    }
+  }
 
-  const result = {
-    score: signals.score,
-    riskLevel: riskFromScore(signals.score),
-    summary: t(uiLang, "summary"),
-    reasons: [
-      ...signals.reasons,
-      ...(claims.length ? ["Exemples d’affirmations détectées: " + claims.slice(0, 3).join(" | ")] : []),
-      proMode
-        ? `Mode PRO actif (preuve web: ${PROVIDER}${BING_API_KEY || SERPAPI_KEY ? ", clé détectée" : ", aucune clé fournie"})`
-        : "Mode Standard: analyse prudente sans preuve web externe",
-    ],
-    confidence,
-    sources,
-  };
+  // Adjust score slightly using corroboration in PRO
+  let finalScore = base.score;
+  if (mode === "pro") {
+    if (corroboration.outcome === "confirmed") finalScore = clamp(finalScore + 10, 5, 98);
+    if (corroboration.outcome === "contradicted") finalScore = clamp(finalScore - 12, 5, 98);
+    if (corroboration.outcome === "mixed") finalScore = clamp(finalScore - 4, 5, 98);
+  }
 
-  return res.json({
-    status: "success",
+  const riskLevel = finalScore >= 75 ? "low" : finalScore >= 50 ? "medium" : "high";
+  const summary = buildSummary(lang, mode, finalScore, riskLevel, corroboration);
+  const articleSummary = buildArticleSummary(lang, mode, corroboration);
+
+  // Ensure breakdown exists (Lovable UI cards rely on it)
+  const breakdown = base.breakdown;
+
+  // Output in Lovable-compatible shape:
+  // raw: { status, requestId, engine, mode, result:{ score,riskLevel,summary,articleSummary,confidence,reasons,breakdown,corroboration,sources,bestLinks } }
+  const out = {
+    status: "ok",
     requestId,
     engine: ENGINE_NAME,
-    mode: proMode ? "pro" : "standard",
-    result,
-    meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
-  });
+    mode,
+    analysisType: mode, // for compatibility
+    result: {
+      score: finalScore,
+      riskLevel,
+      summary,
+      articleSummary,
+      confidence: base.confidence,
+      reasons: base.reasons,
+      breakdown,
+      corroboration,
+      sources,
+      bestLinks,
+      // extra: coverage fields (useful for your “Couverture de vérification” UI)
+      coverage,
+    },
+    meta: {
+      tookMs: nowMs() - t0,
+      version: ENGINE_VERSION,
+      lang,
+      provider: WEB_EVIDENCE_PROVIDER,
+    },
+  };
+
+  return res.json(out);
 });
 
-// --------------------------
-// Start
-// --------------------------
-
+// ---- Start
 app.listen(PORT, () => {
-  console.log(`✅ IA11 API running on port ${PORT} (${ENGINE_NAME} ${ENGINE_VERSION})`);
-  console.log(`🔐 IA11 keys loaded: ${VALID_KEYS.length} key(s)`);
+  console.log(`[IA11] running on :${PORT} | version=${ENGINE_VERSION}`);
+  console.log(`[IA11] keys loaded: ${allowedKeys.size > 0 ? "yes" : "no"}`);
+  console.log(`[IA11] web provider=${WEB_EVIDENCE_PROVIDER} | bing_key=${BING_API_KEY ? "yes" : "no"}`);
 });

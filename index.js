@@ -35,6 +35,9 @@ const PORT = parseInt(process.env.PORT || "10000", 10);
 const IA11_API_KEY_RAW = (process.env.IA11_API_KEY || "").toString();
 // Optional multi-keys (comma separated)
 const IA11_API_KEYS_RAW = (process.env.IA11_API_KEYS || "").toString();
+console.log("IA11_API_KEY_RAW length:", IA11_API_KEY_RAW.length);
+console.log("IA11_API_KEYS_RAW length:", IA11_API_KEYS_RAW.length);
+
 
 // Optional keys for future “real web evidence”
 const BING_API_KEY = (process.env.BING_API_KEY || "").toString().trim();

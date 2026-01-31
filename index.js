@@ -22,10 +22,10 @@
  * - { text: "...", language: "fr", analysisType: "standard"|"pro" }
  * - or { content: "..." } (alias)
  */
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto");
 
-import express from "express";
-import cors from "cors";
-import crypto from "crypto";
 
 const app = express();
 

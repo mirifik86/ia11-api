@@ -1,6 +1,9 @@
 {
   "name": "ia11-api",
   "version": "1.0.0",
+  "engines": {
+    "node": "18.x"
+  },
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -10,7 +13,5 @@
     "cors": "^2.8.5",
     "express": "^4.18.3",
     "express-rate-limit": "^7.5.0"
-  
-
   }
 }

@@ -3,7 +3,7 @@
  * - Express + CORS allowlist
  * - JSON limit 1mb
  * - Key auth: header "x-ia11-key" must match env IA11_API_KEY
- * - Rate limits: standard vs PRO
+ * - Rate limits: standard vs PRO (robust in-memory limiter, no hangs)
  * - Response contract v1:
  *   { status, requestId, engine, mode, result{score,riskLevel,summary,reasons,confidence,sources[]}, meta{tookMs,version} }
  *
@@ -15,7 +15,6 @@
 
 const express = require("express");
 const cors = require("cors");
-const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 
 const app = express();
@@ -37,7 +36,7 @@ const RATE_LIMIT_PER_MIN_PRO = Number(process.env.RATE_LIMIT_PER_MIN_PRO || 30);
 const IA11_API_KEY = (process.env.IA11_API_KEY || "").trim();
 
 const ENGINE_NAME = "IA11";
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 
 // Optional: allowlist CORS origins (comma-separated). If empty, allow all.
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
@@ -94,7 +93,19 @@ function isProbablyProMode(mode) {
 function detectLangVerySimple(text) {
   // VERY simple heuristic, good enough for now
   const t = (text || "").toLowerCase();
-  const frHits = [" le ", " la ", " les ", " des ", " est ", " pas ", "président", "premier ministre", "gouvernement"];
+  const frHits = [
+    " le ",
+    " la ",
+    " les ",
+    " des ",
+    " est ",
+    " pas ",
+    "président",
+    "premier ministre",
+    "première ministre",
+    "gouvernement",
+    "états-unis",
+  ];
   let frScore = 0;
   frHits.forEach((k) => {
     if (t.includes(k)) frScore += 1;
@@ -119,7 +130,6 @@ function cacheGet(key) {
 
 function cacheSet(key, value) {
   if (CACHE_MAX_ITEMS > 0 && cache.size >= CACHE_MAX_ITEMS) {
-    // naive eviction: delete first key
     const firstKey = cache.keys().next().value;
     if (firstKey) cache.delete(firstKey);
   }
@@ -127,21 +137,41 @@ function cacheSet(key, value) {
 }
 
 /* -------------------------------
-   Rate limiting
+   Rate limiting (ROBUST, no hangs)
+   - In-memory per minute counters by (mode + ip)
 -------------------------------- */
-const standardLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: RATE_LIMIT_PER_MIN,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const rlState = new Map(); // key -> { windowStartMs, count }
 
-const proLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: RATE_LIMIT_PER_MIN_PRO,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+function getClientIp(req) {
+  // Respect proxy headers if present (Render usually sets them)
+  const xff = String(req.headers["x-forwarded-for"] || "").trim();
+  if (xff) return xff.split(",")[0].trim();
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
+function rateLimitCheck(req, isPro) {
+  const limit = isPro ? RATE_LIMIT_PER_MIN_PRO : RATE_LIMIT_PER_MIN;
+  const windowMs = 60 * 1000;
+
+  const ip = getClientIp(req);
+  const key = `${isPro ? "pro" : "standard"}::${ip}`;
+
+  const now = nowMs();
+  const entry = rlState.get(key);
+
+  if (!entry || now - entry.windowStartMs >= windowMs) {
+    rlState.set(key, { windowStartMs: now, count: 1 });
+    return { ok: true, limit, remaining: limit - 1, resetMs: now + windowMs };
+  }
+
+  if (entry.count >= limit) {
+    return { ok: false, limit, remaining: 0, resetMs: entry.windowStartMs + windowMs };
+  }
+
+  entry.count += 1;
+  rlState.set(key, entry);
+  return { ok: true, limit, remaining: Math.max(0, limit - entry.count), resetMs: entry.windowStartMs + windowMs };
+}
 
 /* -------------------------------
    ROUTES
@@ -190,17 +220,26 @@ app.post("/v1/analyze", async (req, res) => {
   const mode = String(req.body?.mode || "standard").toLowerCase();
   const isPro = isProbablyProMode(mode);
 
-  // Apply rate limit (manual trigger)
-  // We run the limiter as middleware function:
-  const limiter = isPro ? proLimiter : standardLimiter;
-  let limiterDone = false;
-  await new Promise((resolve) => {
-    limiter(req, res, () => {
-      limiterDone = true;
-      resolve();
+  // Rate limit (robust)
+  const rl = rateLimitCheck(req, isPro);
+  res.setHeader("X-RateLimit-Limit", String(rl.limit));
+  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  res.setHeader("X-RateLimit-Reset", String(Math.ceil(rl.resetMs / 1000)));
+
+  if (!rl.ok) {
+    return res.status(429).json({
+      status: "error",
+      requestId,
+      engine: ENGINE_NAME,
+      mode: isPro ? "pro" : "standard",
+      error: "Rate limit exceeded",
+      meta: {
+        tookMs: nowMs() - t0,
+        version: VERSION,
+        retryAfterSeconds: Math.max(1, Math.ceil((rl.resetMs - nowMs()) / 1000)),
+      },
     });
-  });
-  if (!limiterDone) return; // limiter already responded
+  }
 
   if (!text) {
     return res.status(400).json({
@@ -225,7 +264,9 @@ app.post("/v1/analyze", async (req, res) => {
   }
 
   // Cache (optional)
-  const cacheKey = `${mode}::${text}`;
+  // Include lang in cache key because messages vary by language
+  const lang = detectLangVerySimple(text);
+  const cacheKey = `${isPro ? "pro" : "standard"}::${lang}::${text}`;
   const cached = cacheGet(cacheKey);
   if (cached) {
     return res.json({
@@ -236,11 +277,7 @@ app.post("/v1/analyze", async (req, res) => {
   }
 
   // Analyze
-  const lang = detectLangVerySimple(text);
-
-  const result = isPro
-    ? await analyzePro(text, lang)
-    : await analyzeStandard(text, lang);
+  const result = isPro ? await analyzePro(text, lang) : await analyzeStandard(text, lang);
 
   const response = {
     status: "ok",
@@ -292,10 +329,7 @@ async function analyzeStandard(text, lang) {
           "Analyse rapide (standard) : cohérence et qualité du contenu.",
           "Aucune vérification multi-sources complète en standard.",
         ]
-      : [
-          "Fast standard check: coherence and content quality.",
-          "No full multi-source verification in standard mode.",
-        ];
+      : ["Fast standard check: coherence and content quality.", "No full multi-source verification in standard mode."];
 
   return {
     score: clamp(Math.round(score), 5, 98),
@@ -329,7 +363,7 @@ async function analyzePro(text, lang) {
   } else {
     score = 76;
     riskLevel = "medium";
-    confidence = 0.80;
+    confidence = 0.8;
   }
 
   // --- Upgrade C: two-pass pipeline (claims)
@@ -338,18 +372,15 @@ async function analyzePro(text, lang) {
   const reasons = [];
   const sources = [];
 
-  if (lang === "fr") {
-    reasons.push(`Mode PRO : vérification ciblée sur ${claims.length} affirmation(s) principale(s).`);
-  } else {
-    reasons.push(`PRO mode: targeted verification on ${claims.length} key claim(s).`);
-  }
+  if (lang === "fr") reasons.push(`Mode PRO : vérification ciblée sur ${claims.length} affirmation(s) principale(s).`);
+  else reasons.push(`PRO mode: targeted verification on ${claims.length} key claim(s).`);
 
   // --- Upgrade A: institutional fact-check on claims
   const checks = [];
   for (const c of claims) {
     if (shouldRunInstitutionalFactCheck(c)) {
       try {
-        const fact = await institutionalFactCheck(c);
+        const fact = await institutionalFactCheck(c, lang);
         if (fact?.ran) checks.push(fact);
       } catch (e) {
         checks.push({ ran: true, error: String(e?.message || e) });
@@ -357,14 +388,12 @@ async function analyzePro(text, lang) {
     }
   }
 
-  // Apply checks effect
   for (const fact of checks) {
     if (fact.error) {
-      // Don’t punish score if Wikidata was temporarily unavailable; just note it.
       reasons.push(
         lang === "fr"
-          ? "Vérification institutionnelle : source temporairement indisponible."
-          : "Institutional verification: source temporarily unavailable."
+          ? "Vérification institutionnelle : source temporairement indisponible (réessaie plus tard)."
+          : "Institutional verification: source temporarily unavailable (try again later)."
       );
       continue;
     }
@@ -379,31 +408,23 @@ async function analyzePro(text, lang) {
       });
     }
 
-    // Always add the note (clear and explicit)
-    reasons.push(
-      lang === "fr"
-        ? fact.noteFr || fact.note || "Vérification institutionnelle effectuée."
-        : fact.noteEn || fact.note || "Institutional verification completed."
-    );
+    reasons.push(fact.note || (lang === "fr" ? "Vérification institutionnelle effectuée." : "Institutional verification completed."));
 
-    // If user explicitly names someone else and it conflicts, punish score strongly
     if (fact.isConsistent === false) {
       score -= 25;
       riskLevel = "high";
-      confidence = Math.min(confidence, 0.60);
+      confidence = Math.min(confidence, 0.6);
     }
   }
 
-  // Small bonus if we ran at least one check successfully
   if (checks.some((c) => c.ran && !c.error)) {
     score += 3;
     confidence = Math.min(0.92, confidence + 0.03);
   }
 
-  // Ensure score bounds
+  // Ensure bounds
   score = clamp(Math.round(score), 5, 98);
 
-  // Summary (keep it clean)
   const summary =
     lang === "fr"
       ? "Analyse PRO : extraction des affirmations clés + vérifications renforcées sur les faits institutionnels (ex. dirigeants)."
@@ -504,7 +525,6 @@ function detectCountryQid(text = "") {
 function detectRole(text = "") {
   const t = String(text || "").toLowerCase();
 
-  // Start simple:
   // P35 = head of state (often President)
   // P6  = head of government (Prime Minister)
   if (t.includes("prime minister") || t.includes("premier ministre") || t.includes("première ministre")) {
@@ -518,7 +538,7 @@ function detectRole(text = "") {
 
 async function queryWikidataLeader(countryQid, roleProperty) {
   if (typeof fetch !== "function") {
-    throw new Error("Fetch not available in this Node runtime.");
+    throw new Error("Fetch not available in this Node runtime. Use Node 18+ on Render.");
   }
 
   const sparql = `
@@ -542,15 +562,13 @@ async function queryWikidataLeader(countryQid, roleProperty) {
     headers: { "User-Agent": "IA11/1.0 (LeenScore institutional fact-check)" },
   });
 
-  if (!res.ok) {
-    throw new Error(`Wikidata error: ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Wikidata error: ${res.status}`);
 
   const json = await res.json();
   const rows = json?.results?.bindings || [];
   if (!rows.length) return null;
 
-  // Prefer an entry with no end date (current), else the latest by start
+  // Prefer entry with no end date (current), else latest by start
   const current = rows.find((r) => !r.end) || rows[0];
 
   const leader = {
@@ -565,35 +583,26 @@ async function queryWikidataLeader(countryQid, roleProperty) {
 }
 
 function guessIfTextNamesDifferentLeader(text, verifiedLeaderName) {
-  // Simple heuristic:
-  // - If text contains verified leader name -> consistent
-  // - If text contains common alternative names but NOT verified -> inconsistent
-  // (We keep this conservative to avoid false contradictions.)
   const t = String(text || "").toLowerCase();
   const leader = String(verifiedLeaderName || "").toLowerCase();
-
   if (!leader) return null;
+
   if (t.includes(leader)) return true;
 
-  // If user explicitly says "is X" with a proper name, we try to detect mismatch.
-  // Basic: look for patterns like "is Donald Trump" / "est Donald Trump"
+  // If the text explicitly names someone with "is X Y" / "est X Y"
   const patterns = [/is\s+([a-z]+)\s+([a-z]+)/i, /est\s+([a-z]+)\s+([a-z]+)/i];
   for (const p of patterns) {
     const m = String(text).match(p);
     if (m && m[1] && m[2]) {
       const candidate = `${m[1]} ${m[2]}`.toLowerCase();
-      if (candidate && candidate !== leader) {
-        // Text names someone else explicitly -> likely inconsistent
-        return false;
-      }
+      if (candidate && candidate !== leader) return false;
     }
   }
 
-  // Unknown (text doesn't name a person clearly)
   return null;
 }
 
-async function institutionalFactCheck(text = "") {
+async function institutionalFactCheck(text = "", lang = "en") {
   const country = detectCountryQid(text);
   const role = detectRole(text);
   if (!country || !role) return { ran: false };
@@ -603,6 +612,23 @@ async function institutionalFactCheck(text = "") {
 
   const consistency = guessIfTextNamesDifferentLeader(text, leader.name);
 
+  let note = "";
+  if (lang === "fr") {
+    note =
+      consistency === true
+        ? `Vérification institutionnelle : cohérent avec Wikidata (${role.label} de ${country.key} = ${leader.name}).`
+        : consistency === false
+        ? `Vérification institutionnelle : l’affirmation contredit Wikidata (${role.label} de ${country.key} = ${leader.name}).`
+        : `Vérification institutionnelle : ${role.label} de ${country.key} vérifié via Wikidata = ${leader.name}.`;
+  } else {
+    note =
+      consistency === true
+        ? `Institutional check: consistent with Wikidata (${role.label} of ${country.key} = ${leader.name}).`
+        : consistency === false
+        ? `Institutional check: claim conflicts with Wikidata (${role.label} of ${country.key} = ${leader.name}).`
+        : `Institutional check: verified via Wikidata (${role.label} of ${country.key} = ${leader.name}).`;
+  }
+
   return {
     ran: true,
     country: country.key,
@@ -610,18 +636,7 @@ async function institutionalFactCheck(text = "") {
     leaderName: leader.name,
     leaderWikidataUrl: leader.wikidataUrl,
     isConsistent: consistency,
-    noteFr:
-      consistency === true
-        ? `Vérification institutionnelle : cohérent avec Wikidata (${role.label} de ${country.key} = ${leader.name}).`
-        : consistency === false
-        ? `Vérification institutionnelle : l’affirmation contredit les données Wikidata (${role.label} de ${country.key} = ${leader.name}).`
-        : `Vérification institutionnelle : ${role.label} de ${country.key} vérifié via Wikidata = ${leader.name}.`,
-    noteEn:
-      consistency === true
-        ? `Institutional check: consistent with Wikidata (${role.label} of ${country.key} = ${leader.name}).`
-        : consistency === false
-        ? `Institutional check: claim conflicts with Wikidata (${role.label} of ${country.key} = ${leader.name}).`
-        : `Institutional check: verified via Wikidata (${role.label} of ${country.key} = ${leader.name}).`,
+    note,
   };
 }
 
@@ -660,7 +675,6 @@ function cleanSources(sources = [], max = 6) {
     const url = normalizeUrl(raw);
     if (!url) continue;
 
-    // Skip obvious homepages (keeps sources "article-like")
     if (isLikelyHomepage(url)) continue;
 
     try {

@@ -14,32 +14,24 @@ import cors from "cors";
 import crypto from "crypto";
 
 // --------------------------
-// Env / Config
+// Env
 // --------------------------
 
-const PORT = process.env.PORT || 3000;
-
+const ENGINE_NAME = "IA11";
+const ENGINE_VERSION = "1.3.0-beton-arme";
 const IA11_API_KEY = process.env.IA11_API_KEY || "";
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-// Rate limit
-const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "30", 10);
-const RATE_LIMIT_PER_MIN_PRO = parseInt(process.env.RATE_LIMIT_PER_MIN_PRO || "60", 10);
-
-// Web provider for PRO
 const WEB_PROVIDER = (process.env.WEB_PROVIDER || "bing").toLowerCase();
 const BING_API_KEY = process.env.BING_API_KEY || "";
 const BING_ENDPOINT = process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search";
+const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 30);
+const RATE_LIMIT_PER_MIN_PRO = Number(process.env.RATE_LIMIT_PER_MIN_PRO || 60);
 
-// "Now" year anchor (important for time-sensitive claims)
-const NOW_YEAR = parseInt(process.env.NOW_YEAR || "2026", 10);
+// IMPORTANT: In production, set a comma-separated allowlist:
+// CORS_ORIGIN="https://solairleens.lovable.app,https://leenscore.com,https://www.leenscore.com"
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "";
 
-// Safety toggles
-const MAX_TEXT_CHARS = parseInt(process.env.MAX_TEXT_CHARS || "12000", 10);
-const MAX_CLAIMS = parseInt(process.env.MAX_CLAIMS || "6", 10);
-
-const ENGINE_NAME = "IA11";
-const ENGINE_VERSION = "2.2.1";
+const NOW = new Date();
+const NOW_YEAR = NOW.getUTCFullYear();
 
 // --------------------------
 // App
@@ -47,9 +39,35 @@ const ENGINE_VERSION = "2.2.1";
 
 const app = express();
 
+app.set("trust proxy", 1);
+
+// Basic security headers (lightweight, production-friendly)
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  next();
+});
+
+// CORS allowlist
+const ALLOWED_ORIGINS = CORS_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean);
+
 app.use(
   cors({
-    origin: CORS_ORIGIN,
+    origin: (origin, cb) => {
+      // allow server-to-server / curl / no-origin requests
+      if (!origin) return cb(null, true);
+
+      // If allowlist not set: strict in production, permissive in dev
+      if (ALLOWED_ORIGINS.length === 0) {
+        if ((process.env.NODE_ENV || "").toLowerCase() !== "production") return cb(null, true);
+        return cb(new Error("CORS blocked"));
+      }
+
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"));
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "x-ia11-key", "x-tier", "x-lang"],
   })
@@ -63,11 +81,26 @@ app.use(express.json({ limit: "1mb" }));
 
 const rateMap = new Map(); // key -> { windowStart, count }
 
+function getClientId(req) {
+  // Prefer key-based limiting (stable) but never store/log the raw key
+  const rawKey = (req.headers["x-ia11-key"] || "").toString().trim();
+  if (rawKey) {
+    return "k:" + crypto.createHash("sha256").update(rawKey).digest("hex").slice(0, 16);
+  }
+
+  // Fallback to real client IP (trust proxy enabled)
+  const xff = (req.headers["x-forwarded-for"] || "").toString();
+  const ipFromXff = xff.split(",")[0].trim();
+  const ip = ipFromXff || req.ip || "unknown";
+  return "ip:" + ip;
+}
+
 function rateLimit(req, res, next) {
   const tier = (req.headers["x-tier"] || "standard").toString().toLowerCase();
   const limit = tier === "pro" || tier === "premium" || tier === "premium_plus" ? RATE_LIMIT_PER_MIN_PRO : RATE_LIMIT_PER_MIN;
 
-  const key = `${req.ip}:${tier}`;
+  const clientId = getClientId(req);
+  const key = `${clientId}:${tier}`;
   const now = Date.now();
   const windowMs = 60_000;
 
@@ -113,13 +146,13 @@ function requireKey(req, res, next) {
       status: "error",
       requestId: requestId(),
       engine: ENGINE_NAME,
-      mode: (req.headers["x-tier"] || "standard").toString(),
+      mode: "standard",
       result: {
-        score: 10,
+        score: 15,
         riskLevel: "high",
         summary: "Unauthorized.",
-        reasons: ["Invalid API key."],
-        confidence: 0.8,
+        reasons: ["Missing or invalid x-ia11-key."],
+        confidence: 0.5,
         sources: [],
       },
       meta: { tookMs: 0, version: ENGINE_VERSION },
@@ -129,470 +162,93 @@ function requireKey(req, res, next) {
 }
 
 // --------------------------
-// Routes
+// Utils
 // --------------------------
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok", engine: ENGINE_NAME, version: ENGINE_VERSION });
-});
-
-app.get("/v1/analyze", (req, res) => {
-  res.json({
-    status: "ok",
-    engine: ENGINE_NAME,
-    version: ENGINE_VERSION,
-    routes: ["POST /v1/analyze"],
-  });
-});
-
-app.post("/v1/analyze", rateLimit, requireKey, async (req, res) => {
-  const started = Date.now();
-
-  const tier = (req.headers["x-tier"] || "standard").toString().toLowerCase();
-  const uiLangHeader = (req.headers["x-lang"] || "").toString().toLowerCase();
-
-  const text = (req.body && (req.body.text || req.body.content || "")).toString();
-
-  if (!text || !text.trim()) {
-    return res.status(400).json({
-      status: "error",
-      requestId: requestId(),
-      engine: ENGINE_NAME,
-      mode: tier,
-      result: {
-        score: 15,
-        riskLevel: "high",
-        summary: "Missing text.",
-        reasons: ["No analyzable text was provided."],
-        confidence: 0.9,
-        sources: [],
-      },
-      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
-    });
-  }
-
-  const clipped = text.slice(0, MAX_TEXT_CHARS);
-
-  const detectedLang = detectLanguage(clipped) || "en";
-  const lang = normalizeLang(uiLangHeader) || normalizeLang(detectedLang) || "en";
-
-  try {
-    const out = await analyzeText(clipped, tier, lang);
-    const tookMs = Date.now() - started;
-
-    return res.json({
-      status: "ok",
-      requestId: out.requestId,
-      engine: ENGINE_NAME,
-      mode: tier,
-      result: out.result,
-      meta: { tookMs, version: ENGINE_VERSION },
-    });
-  } catch (err) {
-    const tookMs = Date.now() - started;
-    return res.status(500).json({
-      status: "error",
-      requestId: requestId(),
-      engine: ENGINE_NAME,
-      mode: tier,
-      result: {
-        score: 25,
-        riskLevel: "high",
-        summary: t(lang, "server_error_summary"),
-        reasons: [t(lang, "server_error_reason")],
-        confidence: 0.6,
-        sources: [],
-      },
-      meta: { tookMs, version: ENGINE_VERSION },
-    });
-  }
-});
-
-// --------------------------
-// Core analysis
-// --------------------------
-
-async function analyzeText(text, tier, lang) {
-  const reqId = requestId();
-
-  const cleaned = normalizeSpaces(text);
-  const signals = [];
-
-  // Base: format / style heuristics
-  const capsRatio = ratioCaps(cleaned);
-  const exclamCount = (cleaned.match(/!/g) || []).length;
-  const hasManyLinks = (cleaned.match(/https?:\/\//g) || []).length >= 2;
-  const hasAllCapsWords = /\b[A-Z]{5,}\b/.test(cleaned);
-
-  // Claim extraction
-  const claims = extractClaims(cleaned, lang).slice(0, MAX_CLAIMS);
-
-  // Time-sensitive cue
-  const isTimeSensitive = detectTimeSensitive(cleaned, lang);
-
-  // Standard mode: heuristics only (no external web)
-  const proEnabled = tier === "pro" || tier === "premium" || tier === "premium_plus";
-
-  // Build scoring
-  let score = 70;
-
-  // Style penalties/bonuses
-  if (capsRatio > 0.25) {
-    signals.push({ id: "style_caps", impact: -8, note: t(lang, "sig_caps") });
-    score -= 8;
-  }
-  if (exclamCount >= 4) {
-    signals.push({ id: "style_exclam", impact: -6, note: t(lang, "sig_exclam") });
-    score -= 6;
-  }
-  if (hasAllCapsWords) {
-    signals.push({ id: "style_allcaps_words", impact: -5, note: t(lang, "sig_allcaps") });
-    score -= 5;
-  }
-  if (hasManyLinks) {
-    signals.push({ id: "style_many_links", impact: -3, note: t(lang, "sig_many_links") });
-    score -= 3;
-  }
-
-  // Claim count logic
-  if (claims.length === 0) {
-    signals.push({ id: "no_clear_claims", impact: -10, note: t(lang, "sig_no_claims") });
-    score -= 10;
-  } else if (claims.length >= 4) {
-    signals.push({ id: "many_claims", impact: -6, note: t(lang, "sig_many_claims") });
-    score -= 6;
-  } else {
-    signals.push({ id: "some_claims", impact: +2, note: t(lang, "sig_some_claims") });
-    score += 2;
-  }
-
-  // Time-sensitive: in standard, we can't verify reliably -> conservative penalty
-  if (isTimeSensitive && !proEnabled) {
-    signals.push({ id: "time_sensitive_no_web", impact: -18, note: t(lang, "sig_time_sensitive") });
-    score -= 18;
-  }
-
-  // PRO: web verification
-  let webEvidence = [];
-  if (proEnabled) {
-    if (WEB_PROVIDER === "bing" && BING_API_KEY) {
-      webEvidence = await verifyClaimsWithWeb(claims, lang);
-    } else {
-      // PRO without key/provider: behave like standard but label
-      signals.push({ id: "pro_no_web_provider", impact: -6, note: t(lang, "sig_pro_no_web") });
-      score -= 6;
-    }
-  }
-
-  // Apply web evidence impact conservatively
-  if (proEnabled && webEvidence.length) {
-    const { evidenceScoreDelta, evidenceSignals, sources } = aggregateEvidence(webEvidence, lang);
-    score += evidenceScoreDelta;
-    for (const s of evidenceSignals) signals.push(s);
-
-    // Final clamp
-    score = clamp(score, 5, 98);
-
-    const riskLevel = scoreToRisk(score);
-    const confidence = scoreToConfidence(score, proEnabled, webEvidence);
-
-    const summary = buildSummary(cleaned, claims, signals, webEvidence, score, lang, proEnabled);
-
-    const reasons = buildReasons(signals, lang);
-
-    return {
-      requestId: reqId,
-      result: {
-        score,
-        riskLevel,
-        summary,
-        reasons,
-        confidence,
-        sources,
-      },
-    };
-  }
-
-  // Standard output (or PRO without web)
-  score = clamp(score, 5, 98);
-
-  const riskLevel = scoreToRisk(score);
-  const confidence = scoreToConfidence(score, proEnabled, webEvidence);
-
-  const summary = buildSummary(cleaned, claims, signals, webEvidence, score, lang, proEnabled);
-  const reasons = buildReasons(signals, lang);
-
-  return {
-    requestId: reqId,
-    result: {
-      score,
-      riskLevel,
-      summary,
-      reasons,
-      confidence,
-      sources: [], // standard keeps empty (PRO value)
-    },
-  };
+function requestId() {
+  return crypto.randomBytes(8).toString("hex");
 }
 
-// --------------------------
-// Web verification (PRO)
-// --------------------------
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
 
-async function verifyClaimsWithWeb(claims, lang) {
+function normalizeSpaces(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function safeLower(s) {
+  return String(s || "").toLowerCase();
+}
+
+function safeLen(s) {
+  return String(s || "").length;
+}
+
+function uniqBy(arr, keyFn) {
+  const seen = new Set();
   const out = [];
-
-  for (const claim of claims || []) {
-    const query = buildSearchQuery(claim, lang);
-    const results = await webSearch(query, lang);
-    const judged = judgeSearchResultsAgainstClaim(claim, results, lang);
-
-    out.push({
-      claim,
-      query,
-      judged,
-    });
+  for (const x of arr || []) {
+    const k = keyFn(x);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(x);
+    }
   }
-
   return out;
 }
 
-function buildSearchQuery(claim, lang) {
-  const clean = normalizeSpaces(claim);
-
-  // For “living” political roles, force a current-year context to avoid stale snippets
-  const lower = clean.toLowerCase();
-  const isPolitics = topicMatch(lower, lang, langKeywords(lang, "topics_politics"));
-
-  if (isPolitics) {
-    // This prevents results that talk about “former / ex / previous” from older contexts
-    return `${clean} ${NOW_YEAR} current official sources`;
-  }
-
-  return clean;
-}
-
-async function webSearch(query, lang) {
+function urlDomain(u) {
   try {
-    if (WEB_PROVIDER === "bing") {
-      const res = await fetch(
-        `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&mkt=${bingMarket(lang)}&count=6&textDecorations=false&textFormat=Raw`,
-        {
-          headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
-        }
-      );
-
-      if (!res.ok) return [];
-
-      const json = await res.json();
-      const items = (json.webPages && json.webPages.value) || [];
-      return items.map((x) => ({
-        name: x.name,
-        url: x.url,
-        snippet: x.snippet,
-      }));
-    }
-  } catch (_) {}
-
-  return [];
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
-function judgeSearchResultsAgainstClaim(claim, results, lang) {
-  const lowerClaim = String(claim || "").toLowerCase();
-  const tokens = claimTokens(lowerClaim);
-
-  // “not currently” can be implied without explicit negation (esp. politics)
-  const roleShiftCues = [
-    "former",
-    "ex-",
-    "ex ",
-    "previous",
-    "past",
-    "ancien",
-    "ancienne",
-    "précédent",
-    "précédente",
-    "ex-président",
-    "ancien président",
-    "быв" // ru stem for “former”
-  ];
-
-  const claimHasNegation = containsNegation(lowerClaim, lang);
-
-  let strongSupportHits = 0;
-  let strongContradictHits = 0;
-
-  const sources = [];
-  const seen = new Set();
-
-  for (const r of results || []) {
-    if (!r || !r.url) continue;
-
-    // Reject generic homepages / category pages when possible
-    if (isLowValueLandingUrl(r.url)) continue;
-
-    // De-dup URLs (prevents duplicate sources)
-    const u = normalizeUrl(r.url);
-    if (seen.has(u)) continue;
-    seen.add(u);
-
-    const lower = (String(r.name || "") + " " + String(r.snippet || "")).toLowerCase();
-
-    // Match strength
-    const overlap = tokenOverlap(tokens, claimTokens(lower));
-
-    // Treat “former/ex/ancien/быв...” as a soft negation cue
-    const hasNegation = containsNegation(lower, lang) || roleShiftCues.some((w) => lower.includes(w));
-
-    // Only count STRONG matches; weak matches must not flip the verdict
-    const isStrong = overlap >= 0.5;
-
-    if (isStrong) {
-      if (claimHasNegation === hasNegation) strongSupportHits += 1;
-      else strongContradictHits += 1;
-    }
-
-    sources.push({
-      title: r.name,
-      url: u,
-      snippet: r.snippet,
-      confidence: sourceConfidenceFromOverlap(overlap),
-      quality: sourceQualityTier(u),
-    });
-
-    if (sources.length >= 8) break;
+function looksLikeHomeOrSection(url) {
+  try {
+    const u = new URL(url);
+    const p = (u.pathname || "/").replace(/\/+$/, "/");
+    // very short paths are often home/section pages
+    if (p === "/" || p.length <= 2) return true;
+    // common “section” patterns
+    const sections = ["/news/", "/politics/", "/world/", "/us/", "/canada/", "/france/", "/en/", "/articles/", "/story/"];
+    const hits = sections.some((s) => p.toLowerCase().startsWith(s));
+    return hits && p.split("/").filter(Boolean).length <= 2;
+  } catch {
+    return true;
   }
-
-  // Final rule: require at least 2 strong signals before declaring supported/contradicted
-  let supported = strongSupportHits >= 2;
-  let contradicted = strongContradictHits >= 2;
-
-  // If sources conflict -> be conservative (never loudly claim “false”)
-  if (supported && contradicted) {
-    supported = false;
-    contradicted = false;
-  }
-
-  return {
-    supported,
-    contradicted,
-    sources: sources.slice(0, 8),
-  };
 }
 
-function aggregateEvidence(webEvidence, lang) {
-  let delta = 0;
-  const signals = [];
-  const sources = [];
+function cleanSources(sources) {
+  const cleaned = (sources || [])
+    .filter((s) => s && s.url)
+    .map((s) => ({
+      name: String(s.name || "").slice(0, 140),
+      url: String(s.url || ""),
+      snippet: String(s.snippet || "").slice(0, 260),
+      domain: urlDomain(s.url),
+    }));
 
-  let supportedCount = 0;
-  let contradictedCount = 0;
-  let neutralCount = 0;
+  // Deduplicate by URL
+  const dedup = uniqBy(cleaned, (x) => x.url);
 
-  for (const e of webEvidence || []) {
-    if (!e || !e.judged) continue;
+  // Prefer deeper article URLs over home/section pages
+  dedup.sort((a, b) => Number(looksLikeHomeOrSection(a.url)) - Number(looksLikeHomeOrSection(b.url)));
 
-    const { supported, contradicted, sources: srcs } = e.judged;
-
-    // Pick best sources (already filtered and de-duped per-claim)
-    for (const s of srcs || []) sources.push(s);
-
-    if (supported) supportedCount += 1;
-    else if (contradicted) contradictedCount += 1;
-    else neutralCount += 1;
+  // Remove duplicates by domain if they are too many
+  const byDomain = [];
+  const domainCount = new Map();
+  for (const s of dedup) {
+    const d = s.domain || "unknown";
+    const c = (domainCount.get(d) || 0) + 1;
+    domainCount.set(d, c);
+    if (c <= 2) byDomain.push(s);
   }
 
-  // Conservative scoring: contradiction needs real support; neutral is "uncertain"
-  if (supportedCount >= 2 && contradictedCount === 0) {
-    delta += 10;
-    signals.push({ id: "web_support", impact: +10, note: t(lang, "sig_web_support") });
-  } else if (contradictedCount >= 2 && supportedCount === 0) {
-    delta -= 18;
-    signals.push({ id: "web_contradict", impact: -18, note: t(lang, "sig_web_contradict") });
-  } else if (supportedCount === 0 && contradictedCount === 0 && neutralCount > 0) {
-    delta -= 6;
-    signals.push({ id: "web_uncertain", impact: -6, note: t(lang, "sig_web_uncertain") });
-  } else {
-    // Mixed evidence -> do not overreact
-    delta -= 4;
-    signals.push({ id: "web_mixed", impact: -4, note: t(lang, "sig_web_mixed") });
-  }
-
-  // Clamp sources to top 10, prioritize higher quality/confidence
-  const unique = dedupeSources(sources).sort((a, b) => {
-    const qa = (b.quality || 0) - (a.quality || 0);
-    if (qa !== 0) return qa;
-    return (b.confidence || 0) - (a.confidence || 0);
-  });
-
-  return {
-    evidenceScoreDelta: delta,
-    evidenceSignals: signals,
-    sources: unique.slice(0, 10).map((s) => ({
-      title: s.title,
-      url: s.url,
-      snippet: s.snippet,
-      confidence: clamp(s.confidence || 0.6, 0.2, 0.95),
-    })),
-  };
+  return byDomain.slice(0, 8);
 }
-
-// --------------------------
-// Summaries / reasons
-// --------------------------
-
-function buildSummary(text, claims, signals, webEvidence, score, lang, isPro) {
-  const risk = scoreToRisk(score);
-
-  const topSignals = signals
-    .slice()
-    .sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact))
-    .slice(0, 3)
-    .map((s) => s.note);
-
-  if (isPro && webEvidence && webEvidence.length) {
-    const { supported, contradicted } = summarizeEvidence(webEvidence);
-
-    if (contradicted) {
-      return t(lang, "summary_pro_contradicted", { risk, top: topSignals.join(" • ") });
-    }
-    if (supported) {
-      return t(lang, "summary_pro_supported", { risk, top: topSignals.join(" • ") });
-    }
-    return t(lang, "summary_pro_uncertain", { risk, top: topSignals.join(" • ") });
-  }
-
-  return t(lang, "summary_standard", { risk, top: topSignals.join(" • ") });
-}
-
-function buildReasons(signals, lang) {
-  const sorted = signals.slice().sort((a, b) => Math.abs(b.impact) - Math.abs(a.impact));
-  const reasons = [];
-  for (const s of sorted.slice(0, 6)) reasons.push(s.note);
-  if (reasons.length === 0) reasons.push(t(lang, "no_reasons"));
-  return reasons;
-}
-
-function summarizeEvidence(webEvidence) {
-  let supported = 0;
-  let contradicted = 0;
-
-  for (const e of webEvidence || []) {
-    const j = e && e.judged;
-    if (!j) continue;
-    if (j.supported) supported += 1;
-    if (j.contradicted) contradicted += 1;
-  }
-
-  return {
-    supported: supported >= 2 && contradicted === 0,
-    contradicted: contradicted >= 2 && supported === 0,
-  };
-}
-
-// --------------------------
-// Language / i18n
-// --------------------------
 
 function normalizeLang(x) {
   if (!x) return "";
@@ -602,6 +258,7 @@ function normalizeLang(x) {
   if (v.startsWith("es")) return "es";
   if (v.startsWith("de")) return "de";
   if (v.startsWith("it")) return "it";
+  if (v.startsWith("pt")) return "pt";
   if (v.startsWith("ja")) return "ja";
   if (v.startsWith("ru")) return "ru";
   if (v.startsWith("uk")) return "uk";
@@ -614,20 +271,19 @@ function detectLanguage(text) {
   // crude heuristic; UI will override via x-lang anyway
   if (/[а-яё]/i.test(s)) return "ru";
   if (/[ぁ-んァ-ン一-龯]/.test(s)) return "ja";
-  if (/\b(le|la|les|des|une|un|dans|avec|pour|mais)\b/.test(s)) return "fr";
-  if (/\b(the|and|with|for|but|because)\b/.test(s)) return "en";
-  if (/\b(el|la|los|las|una|un|con|para|pero)\b/.test(s)) return "es";
-  if (/\b(der|die|das|und|mit|für|aber|weil)\b/.test(s)) return "de";
-  if (/\b(il|lo|la|gli|le|con|per|ma|perché)\b/.test(s)) return "it";
+
+  if (/[àâçéèêëîïôùûüÿœ]/.test(s)) return "fr";
+  if (/[ñáéíóúü¡¿]/.test(s)) return "es";
+  if (/[ßäöü]/.test(s)) return "de";
+  if (/[àèéìòù]/.test(s)) return "it";
+  if (/[ãõç]/.test(s)) return "pt";
+  if (/[\u0400-\u04FF]/.test(s)) return "ru";
   return "en";
 }
 
-function t(lang, key, vars = {}) {
-  const L = I18N[lang] || I18N.en;
-  const template = (L && L[key]) || I18N.en[key] || key;
-
-  return template.replace(/\{(\w+)\}/g, (_, k) => (vars[k] !== undefined ? String(vars[k]) : `{${k}}`));
-}
+// --------------------------
+// I18N (9 languages)
+// --------------------------
 
 const I18N = {
   en: {
@@ -652,6 +308,7 @@ const I18N = {
     summary_pro_uncertain: "Credibility risk: {risk}. Web evidence is inconclusive or mixed. {top}",
     no_reasons: "No strong signals detected.",
   },
+
   fr: {
     server_error_summary: "Erreur serveur pendant l’analyse.",
     server_error_reason: "Une erreur interne est survenue.",
@@ -674,238 +331,198 @@ const I18N = {
     summary_pro_uncertain: "Risque de crédibilité : {risk}. Les sources web sont mitigées ou insuffisantes. {top}",
     no_reasons: "Aucun signal fort détecté.",
   },
+
+  es: {
+    server_error_summary: "Error del servidor durante el análisis.",
+    server_error_reason: "Ocurrió un error interno.",
+    sig_caps: "El exceso de mayúsculas puede sonar sensacionalista.",
+    sig_exclam: "Demasiados signos de exclamación pueden sonar emocionales.",
+    sig_allcaps: "PALABRAS EN MAYÚSCULAS pueden reducir credibilidad.",
+    sig_many_links: "Muchos enlaces sin contexto pueden ser una señal débil.",
+    sig_no_claims: "No se detectó una afirmación clara y verificable.",
+    sig_many_claims: "Demasiadas afirmaciones a la vez dificultan la verificación.",
+    sig_some_claims: "Se detectaron algunas afirmaciones verificables.",
+    sig_time_sensitive: "Afirmación sensible al tiempo: sin web, el modo estándar no puede confirmar.",
+    sig_pro_no_web: "PRO solicitado pero la verificación web no está disponible (proveedor/clave faltante).",
+    sig_web_support: "Varias fuentes parecen apoyar la afirmación.",
+    sig_web_contradict: "Varias fuentes parecen contradecir la afirmación.",
+    sig_web_uncertain: "Hay fuentes, pero la evidencia no es suficiente para concluir.",
+    sig_web_mixed: "Fuentes mixtas o poco claras: el resultado se mantiene conservador.",
+    summary_standard: "Riesgo de credibilidad: {risk}. {top}",
+    summary_pro_supported: "Riesgo de credibilidad: {risk}. La evidencia web tiende a apoyar. {top}",
+    summary_pro_contradicted: "Riesgo de credibilidad: {risk}. La evidencia web tiende a contradecir. {top}",
+    summary_pro_uncertain: "Riesgo de credibilidad: {risk}. La evidencia web es mixta o insuficiente. {top}",
+    no_reasons: "No se detectaron señales fuertes.",
+  },
+
+  de: {
+    server_error_summary: "Serverfehler während der Analyse.",
+    server_error_reason: "Ein interner Fehler ist aufgetreten.",
+    sig_caps: "Viele Großbuchstaben können reißerisch wirken.",
+    sig_exclam: "Viele Ausrufezeichen können emotional wirken.",
+    sig_allcaps: "WÖRTER IN GROSSBUCHSTABEN können die Glaubwürdigkeit senken.",
+    sig_many_links: "Viele Links ohne Kontext können ein schwaches Warnsignal sein.",
+    sig_no_claims: "Keine klare, überprüfbare Behauptung erkannt.",
+    sig_many_claims: "Zu viele Behauptungen auf einmal erschweren die Prüfung.",
+    sig_some_claims: "Einige überprüfbare Behauptungen erkannt.",
+    sig_time_sensitive: "Zeitkritische Behauptung: ohne Web kann der Standardmodus nicht zuverlässig prüfen.",
+    sig_pro_no_web: "PRO angefragt, aber Webprüfung nicht verfügbar (Provider/Key fehlt).",
+    sig_web_support: "Mehrere Quellen scheinen die Behauptung zu stützen.",
+    sig_web_contradict: "Mehrere Quellen scheinen der Behauptung zu widersprechen.",
+    sig_web_uncertain: "Quellen vorhanden, aber Belege reichen nicht für ein Urteil.",
+    sig_web_mixed: "Gemischte/unklare Quellenlage: Ergebnis bleibt konservativ.",
+    summary_standard: "Glaubwürdigkeitsrisiko: {risk}. {top}",
+    summary_pro_supported: "Glaubwürdigkeitsrisiko: {risk}. Web-Belege stützen eher. {top}",
+    summary_pro_contradicted: "Glaubwürdigkeitsrisiko: {risk}. Web-Belege widersprechen eher. {top}",
+    summary_pro_uncertain: "Glaubwürdigkeitsrisiko: {risk}. Web-Belege sind gemischt oder unzureichend. {top}",
+    no_reasons: "Keine starken Signale erkannt.",
+  },
+
+  it: {
+    server_error_summary: "Errore del server durante l’analisi.",
+    server_error_reason: "Si è verificato un errore interno.",
+    sig_caps: "Troppe maiuscole possono sembrare sensazionalistiche.",
+    sig_exclam: "Troppi punti esclamativi possono sembrare emotivi.",
+    sig_allcaps: "PAROLE IN MAIUSCOLO possono ridurre la credibilità.",
+    sig_many_links: "Molti link senza contesto possono essere un segnale debole.",
+    sig_no_claims: "Nessuna affermazione chiara e verificabile rilevata.",
+    sig_many_claims: "Troppe affermazioni insieme rendono la verifica difficile.",
+    sig_some_claims: "Alcune affermazioni verificabili rilevate.",
+    sig_time_sensitive: "Affermazione sensibile al tempo: senza web, la modalità standard non può confermare.",
+    sig_pro_no_web: "PRO richiesto ma la verifica web non è disponibile (provider/chiave mancante).",
+    sig_web_support: "Più fonti sembrano supportare l’affermazione.",
+    sig_web_contradict: "Più fonti sembrano contraddire l’affermazione.",
+    sig_web_uncertain: "Fonti trovate, ma prove insufficienti per decidere.",
+    sig_web_mixed: "Fonti miste o poco chiare: risultato conservativo.",
+    summary_standard: "Rischio di credibilità: {risk}. {top}",
+    summary_pro_supported: "Rischio di credibilità: {risk}. Le prove web tendono a supportare. {top}",
+    summary_pro_contradicted: "Rischio di credibilità: {risk}. Le prove web tendono a contraddire. {top}",
+    summary_pro_uncertain: "Rischio di credibilità: {risk}. Le prove web sono miste o insufficienti. {top}",
+    no_reasons: "Nessun segnale forte rilevato.",
+  },
+
+  pt: {
+    server_error_summary: "Erro do servidor durante a análise.",
+    server_error_reason: "Ocorreu um erro interno.",
+    sig_caps: "Muitas letras maiúsculas podem soar sensacionalistas.",
+    sig_exclam: "Muitos pontos de exclamação podem soar emocionais.",
+    sig_allcaps: "PALAVRAS EM MAIÚSCULAS podem reduzir a credibilidade.",
+    sig_many_links: "Muitos links sem contexto podem ser um sinal fraco.",
+    sig_no_claims: "Nenhuma afirmação clara e verificável foi detectada.",
+    sig_many_claims: "Muitas afirmações de uma vez dificultam a verificação.",
+    sig_some_claims: "Algumas afirmações verificáveis foram detectadas.",
+    sig_time_sensitive: "Afirmação sensível ao tempo: sem web, o modo padrão não pode confirmar com confiança.",
+    sig_pro_no_web: "PRO solicitado, mas a verificação web não está disponível (provedor/chave ausente).",
+    sig_web_support: "Várias fontes parecem apoiar a afirmação.",
+    sig_web_contradict: "Várias fontes parecem contradizer a afirmação.",
+    sig_web_uncertain: "Há fontes, mas a evidência não é suficiente para concluir.",
+    sig_web_mixed: "Fontes mistas/ambíguas: resultado permanece conservador.",
+    summary_standard: "Risco de credibilidade: {risk}. {top}",
+    summary_pro_supported: "Risco de credibilidade: {risk}. Evidência web tende a apoiar. {top}",
+    summary_pro_contradicted: "Risco de credibilidade: {risk}. Evidência web tende a contradizer. {top}",
+    summary_pro_uncertain: "Risco de credibilidade: {risk}. Evidência web é mista ou insuficiente. {top}",
+    no_reasons: "Nenhum sinal forte detectado.",
+  },
+
+  ja: {
+    server_error_summary: "分析中にサーバーエラーが発生しました。",
+    server_error_reason: "内部エラーが発生しました。",
+    sig_caps: "大文字の多用は煽り表現の可能性があります。",
+    sig_exclam: "感嘆符の多用は感情的な文体の可能性があります。",
+    sig_allcaps: "全て大文字の語は信頼性を下げる可能性があります。",
+    sig_many_links: "文脈なしのリンクが多いのは弱い警告サインです。",
+    sig_no_claims: "明確で検証可能な主張が検出されませんでした。",
+    sig_many_claims: "主張が多すぎると検証が難しくなります。",
+    sig_some_claims: "いくつかの検証可能な主張が検出されました。",
+    sig_time_sensitive: "時事性の高い主張：Web証拠なしでは標準モードで確証できません。",
+    sig_pro_no_web: "PROが要求されましたが、Web検証が利用できません（設定/キー不足）。",
+    sig_web_support: "複数ソースが主張を支持している可能性があります。",
+    sig_web_contradict: "複数ソースが主張に反している可能性があります。",
+    sig_web_uncertain: "ソースはありますが、結論づけるには証拠が不十分です。",
+    sig_web_mixed: "ソースが混在/不明確：結果は保守的になります。",
+    summary_standard: "信頼性リスク: {risk}. {top}",
+    summary_pro_supported: "信頼性リスク: {risk}. Web証拠は支持傾向です。{top}",
+    summary_pro_contradicted: "信頼性リスク: {risk}. Web証拠は反証傾向です。{top}",
+    summary_pro_uncertain: "信頼性リスク: {risk}. Web証拠は混在/不足です。{top}",
+    no_reasons: "強いシグナルは検出されませんでした。",
+  },
+
+  ru: {
+    server_error_summary: "Ошибка сервера во время анализа.",
+    server_error_reason: "Произошла внутренняя ошибка.",
+    sig_caps: "Чрезмерные заглавные буквы могут указывать на сенсационную подачу.",
+    sig_exclam: "Много восклицательных знаков может указывать на эмоциональную подачу.",
+    sig_allcaps: "СЛОВА В ВЕРХНЕМ РЕГИСТРЕ могут снижать доверие.",
+    sig_many_links: "Много ссылок без контекста может быть слабым предупреждающим сигналом.",
+    sig_no_claims: "Не обнаружено ясного и проверяемого утверждения.",
+    sig_many_claims: "Слишком много утверждений одновременно усложняет проверку.",
+    sig_some_claims: "Обнаружены некоторые проверяемые утверждения.",
+    sig_time_sensitive: "Заявление зависит от времени: без веб-доказательств стандартный режим не может уверенно подтвердить.",
+    sig_pro_no_web: "Запрошен PRO, но веб-проверка недоступна (нет провайдера/ключа).",
+    sig_web_support: "Несколько источников, похоже, поддерживают утверждение.",
+    sig_web_contradict: "Несколько источников, похоже, противоречат утверждению.",
+    sig_web_uncertain: "Источники найдены, но доказательств недостаточно для вывода.",
+    sig_web_mixed: "Источники смешанные или неясные: результат остаётся консервативным.",
+    summary_standard: "Риск достоверности: {risk}. {top}",
+    summary_pro_supported: "Риск достоверности: {risk}. Веб-доказательства скорее подтверждают. {top}",
+    summary_pro_contradicted: "Риск достоверности: {risk}. Веб-доказательства скорее опровергают. {top}",
+    summary_pro_uncertain: "Риск достоверности: {risk}. Веб-доказательства смешанные или недостаточные. {top}",
+    no_reasons: "Сильных сигналов не обнаружено.",
+  },
+
+  uk: {
+    server_error_summary: "Помилка сервера під час аналізу.",
+    server_error_reason: "Сталася внутрішня помилка.",
+    sig_caps: "Надмірні великі літери можуть виглядати сенсаційно.",
+    sig_exclam: "Багато знаків оклику може вказувати на емоційний тон.",
+    sig_allcaps: "СЛОВА В ВЕРХНЬОМУ РЕГІСТРІ можуть знижувати довіру.",
+    sig_many_links: "Забагато посилань без контексту може бути слабким попереджувальним сигналом.",
+    sig_no_claims: "Не виявлено чіткої та перевірюваної заяви.",
+    sig_many_claims: "Занадто багато заяв одночасно ускладнює перевірку.",
+    sig_some_claims: "Виявлено деякі перевірювані твердження.",
+    sig_time_sensitive: "Заява залежить від часу: без веб-доказів стандартний режим не може впевнено підтвердити.",
+    sig_pro_no_web: "Запитано PRO, але веб-перевірка недоступна (немає провайдера/ключа).",
+    sig_web_support: "Кілька джерел, схоже, підтверджують твердження.",
+    sig_web_contradict: "Кілька джерел, схоже, суперечать твердженню.",
+    sig_web_uncertain: "Джерела знайдено, але доказів недостатньо для висновку.",
+    sig_web_mixed: "Джерела змішані або неясні: результат залишається консервативним.",
+    summary_standard: "Ризик достовірності: {risk}. {top}",
+    summary_pro_supported: "Ризик достовірності: {risk}. Веб-докази радше підтверджують. {top}",
+    summary_pro_contradicted: "Ризик достовірності: {risk}. Веб-докази радше спростовують. {top}",
+    summary_pro_uncertain: "Ризик достовірності: {risk}. Веб-докази змішані або недостатні. {top}",
+    no_reasons: "Сильних сигналів не виявлено.",
+  },
 };
 
-// --------------------------
-// Helpers: scoring
-// --------------------------
-
-function scoreToRisk(score) {
-  if (score >= 80) return "low";
-  if (score >= 55) return "medium";
-  return "high";
+function t(lang, key) {
+  const L = I18N[lang] || I18N.en;
+  return L[key] || I18N.en[key] || key;
 }
 
-function scoreToConfidence(score, isPro, webEvidence) {
-  let base = score >= 80 ? 0.88 : score >= 55 ? 0.72 : 0.58;
-  if (isPro && webEvidence && webEvidence.length) base += 0.06;
-  return clamp(base, 0.45, 0.95);
-}
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
-
-// --------------------------
-// Helpers: text / claims
-// --------------------------
-
-function normalizeSpaces(s) {
-  return String(s || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function ratioCaps(s) {
-  const letters = (s.match(/[a-zA-Z]/g) || []).length;
-  if (!letters) return 0;
-  const caps = (s.match(/[A-Z]/g) || []).length;
-  return caps / letters;
-}
-
-function extractClaims(text, lang) {
-  const s = normalizeSpaces(text);
-
-  // Split into short candidate sentences
-  const parts = s
-    .split(/[\.\n\r]+/)
-    .map((x) => normalizeSpaces(x))
-    .filter(Boolean)
-    .filter((x) => x.length >= 20);
-
-  // Keep likely factual assertions
-  const factualHints = langKeywords(lang, "factual_hints");
-  const out = [];
-  for (const p of parts) {
-    const lower = p.toLowerCase();
-    if (factualHints.some((w) => lower.includes(w))) out.push(p);
-    else if (/\b(is|are|was|were|est|sont|était|sera|won|elected|president|prime minister|président|ministre)\b/i.test(p)) out.push(p);
-  }
-
-  // If empty, fallback to first statement chunk
-  if (out.length === 0 && parts.length) out.push(parts[0]);
-
-  // Deduplicate
-  return dedupeStrings(out).slice(0, 10);
-}
-
-function detectTimeSensitive(text, lang) {
-  const lower = (text || "").toLowerCase();
-
-  // Mentions of a year, "current", "now", "today", or offices that change over time
-  const hasYear = /\b(19|20)\d{2}\b/.test(lower);
-  const timeWords = langKeywords(lang, "time_words");
-  const officeWords = langKeywords(lang, "topics_politics");
-
-  return hasYear || timeWords.some((w) => lower.includes(w)) || officeWords.some((w) => lower.includes(w));
-}
-
-// --------------------------
-// Helpers: evidence matching
-// --------------------------
-
-function claimTokens(s) {
-  return normalizeSpaces(s)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s-]+/gu, " ")
-    .split(/\s+/)
-    .filter((x) => x.length >= 3)
-    .slice(0, 24);
-}
-
-function tokenOverlap(a, b) {
-  const A = new Set(a || []);
-  const B = new Set(b || []);
-  if (!A.size || !B.size) return 0;
-
-  let hit = 0;
-  for (const x of A) if (B.has(x)) hit += 1;
-  return hit / Math.max(1, Math.min(A.size, B.size));
-}
-
-function containsNegation(s, lang) {
-  const lower = (s || "").toLowerCase();
-  const negs = langKeywords(lang, "negations");
-  return negs.some((w) => lower.includes(w));
-}
-
-function isLowValueLandingUrl(url) {
-  const u = (url || "").toLowerCase();
-
-  // Likely homepages / hubs
-  const bad = [
-    "/news",
-    "/latest",
-    "/home",
-    "/index",
-    "/category/",
-    "/topics/",
-    "/tag/",
-    "/search?",
-    "google.com/search",
-    "bing.com/search",
-  ];
-
-  // If it's very short and no path depth, often homepage
-  try {
-    const x = new URL(url);
-    const path = x.pathname || "/";
-    const depth = path.split("/").filter(Boolean).length;
-    if (depth <= 1) return true;
-  } catch (_) {}
-
-  return bad.some((b) => u.includes(b));
-}
-
-function sourceQualityTier(url) {
-  const u = (url || "").toLowerCase();
-
-  // very rough tiers; can expand later
-  const high = [
-    "reuters.com",
-    "apnews.com",
-    "bbc.co.uk",
-    "bbc.com",
-    "theguardian.com",
-    "nytimes.com",
-    "washingtonpost.com",
-    "whitehouse.gov",
-    "gov",
-    "parliament",
-    "europa.eu",
-    "who.int",
-    "un.org",
-  ];
-
-  const mid = ["wikipedia.org", "britannica.com", "cnn.com", "cbsnews.com", "nbcnews.com", "foxnews.com", "politico.com"];
-
-  if (high.some((d) => u.includes(d))) return 3;
-  if (mid.some((d) => u.includes(d))) return 2;
-  return 1;
-}
-
-function sourceConfidenceFromOverlap(overlap) {
-  // overlap in [0..1]
-  if (overlap >= 0.7) return 0.9;
-  if (overlap >= 0.55) return 0.78;
-  if (overlap >= 0.4) return 0.65;
-  return 0.55;
-}
-
-function normalizeUrl(url) {
-  try {
-    const u = new URL(url);
-    u.hash = "";
-    // remove common tracking params
-    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"].forEach((p) => u.searchParams.delete(p));
-    return u.toString();
-  } catch (_) {
-    return String(url || "");
-  }
-}
-
-function dedupeSources(srcs) {
-  const out = [];
-  const seen = new Set();
-  for (const s of srcs || []) {
-    const u = normalizeUrl(s.url);
-    if (!u || seen.has(u)) continue;
-    seen.add(u);
-    out.push({ ...s, url: u });
-  }
-  return out;
-}
-
-function dedupeStrings(arr) {
-  const out = [];
-  const seen = new Set();
-  for (const x of arr || []) {
-    const k = normalizeSpaces(x).toLowerCase();
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(normalizeSpaces(x));
+function formatTemplate(str, vars) {
+  let out = String(str || "");
+  for (const [k, v] of Object.entries(vars || {})) {
+    out = out.replaceAll(`{${k}}`, String(v));
   }
   return out;
 }
 
 // --------------------------
-// Keywords by language
+// Keyword lexicons (claim hints)
 // --------------------------
-
-function langKeywords(lang, key) {
-  const K = KEYWORDS[lang] || KEYWORDS.en;
-  return (K && K[key]) || (KEYWORDS.en && KEYWORDS.en[key]) || [];
-}
-
-function topicMatch(lowerText, lang, words) {
-  for (const w of words || []) {
-    if (lowerText.includes(w)) return true;
-  }
-  return false;
-}
 
 const KEYWORDS = {
   en: {
-    negations: [" not ", "n't", " no ", " never ", " false ", " untrue "],
-    time_words: [" today", " now", " current", " in 20", " this year", " right now"],
-    topics_politics: [" president", " prime minister", " government", " election", " senator", " congress", " parliament", " white house"],
-    factual_hints: [" is ", " are ", " was ", " were ", " won ", " elected ", " announced ", " confirmed ", " according to "],
+    negations: [" not ", " never", " no ", " false", " untrue", " incorrect"],
+    time_words: [" today", " now", " current", " in 20", " this year"],
+    topics_politics: [" president", " prime minister", " government", " election", " senate", " congress", " parliament"],
+    factual_hints: [" is ", " are ", " was ", " were ", " elected", " according to", " confirmed"],
   },
   fr: {
-    negations: [" ne ", " pas", " aucun", " jamais", " faux", " incorrect"],
-    time_words: [" aujourd", " maintenant", " actuel", " en 20", " cette année", " en ce moment"],
-    topics_politics: [" président", " premier ministre", " gouvernement", " élection", " sénateur", " congrès", " parlement", " maison-blanche", "maison blanche"],
-    factual_hints: [" est ", " sont ", " était ", " ont ", " a été ", " élu", " annonc", " confirmé", " selon "],
+    negations: [" ne ", " pas", " jamais", " faux", " erron"],
+    time_words: [" aujourd", " maintenant", " actuel", " en 20", " cette année"],
+    topics_politics: [" président", " premier ministre", " gouvernement", " élection", " sénat", " congrès", " parlement"],
+    factual_hints: [" est ", " sont ", " était", " étaient", " élu", " selon ", " d'après "],
   },
   ru: {
     negations: [" не ", " нет", " никогда", " лож", " невер"],
@@ -943,37 +560,486 @@ const KEYWORDS = {
     topics_politics: ["大統領", "首相", "政府", "選挙", "議会"],
     factual_hints: ["である", "です", "だった", "によると"],
   },
+  pt: {
+    negations: [" não ", " nunca", " falso", " incorreto"],
+    time_words: [" hoje", " agora", " atual", " em 20", " este ano"],
+    topics_politics: [" presidente", " primeiro-ministro", " governo", " eleiç", " senado", " congresso", " parlamento"],
+    factual_hints: [" é ", " são ", " foi ", " eram ", " eleito", " segundo "],
+  },
 };
+
+function langKeywords(lang, key) {
+  return (KEYWORDS[lang] && KEYWORDS[lang][key]) || (KEYWORDS.en && KEYWORDS.en[key]) || [];
+}
+
+function containsNegation(lowerText, lang) {
+  const negs = langKeywords(lang, "negations");
+  return negs.some((n) => lowerText.includes(n));
+}
+
+function topicMatch(lowerText, lang, list) {
+  return (list || []).some((w) => lowerText.includes(w));
+}
+
+function claimTokens(lowerClaim) {
+  // naive tokenization
+  return lowerClaim
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 40);
+}
 
 // --------------------------
 // Market mapping for Bing
 // --------------------------
 
 function bingMarket(lang) {
+  // best-effort markets; keep it simple
   if (lang === "fr") return "fr-CA";
-  if (lang === "en") return "en-US";
+  if (lang === "ru") return "ru-RU";
+  if (lang === "uk") return "uk-UA";
   if (lang === "es") return "es-ES";
   if (lang === "de") return "de-DE";
   if (lang === "it") return "it-IT";
+  if (lang === "pt") return "pt-PT";
   if (lang === "ja") return "ja-JP";
-  if (lang === "ru") return "ru-RU";
-  if (lang === "uk") return "uk-UA";
   return "en-US";
 }
 
 // --------------------------
-// Utils
+// Claim extraction (conservative)
 // --------------------------
 
-function requestId() {
-  return crypto.randomBytes(8).toString("hex");
+function extractClaims(text) {
+  const s = normalizeSpaces(text);
+  if (!s) return [];
+
+  // Split into sentences (very simple)
+  const parts = s.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+
+  // Keep sentences that look factual
+  const claims = [];
+  for (const p of parts) {
+    const lower = p.toLowerCase();
+    const hasHint =
+      langKeywords("en", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("fr", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("ru", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("uk", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("es", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("de", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("it", "factual_hints").some((h) => lower.includes(h)) ||
+      langKeywords("pt", "factual_hints").some((h) => lower.includes(h)) ||
+      /(\b(is|are|was|were|est|sont|été|era|es|son)\b)/i.test(p);
+
+    // length gate
+    if (p.length < 18) continue;
+    if (hasHint) claims.push(p);
+  }
+
+  // Dedup and cap
+  return uniqBy(claims, (x) => x.toLowerCase()).slice(0, 4);
 }
+
+// --------------------------
+// Web verification
+// --------------------------
+
+async function verifyClaimsWithWeb(claims, lang) {
+  const out = [];
+
+  for (const claim of claims || []) {
+    const query = buildSearchQuery(claim, lang);
+    const results = await webSearch(query, lang);
+    const judged = judgeSearchResultsAgainstClaim(claim, results, lang);
+
+    out.push({
+      claim,
+      query,
+      judged,
+    });
+  }
+
+  return out;
+}
+
+function buildSearchQuery(claim, lang) {
+  const clean = normalizeSpaces(claim);
+
+  // For “living” political roles, force a current-year context to avoid stale snippets
+  const lower = clean.toLowerCase();
+  const isPolitics = topicMatch(lower, lang, langKeywords(lang, "topics_politics"));
+
+  if (isPolitics) {
+    return `${clean} ${NOW_YEAR} current official sources`;
+  }
+
+  return clean;
+}
+
+async function webSearch(query, lang) {
+  try {
+    if (WEB_PROVIDER === "bing") {
+      if (!BING_API_KEY) return [];
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Number(process.env.WEB_TIMEOUT_MS || 8000));
+
+      const res = await fetch(
+        `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&mkt=${bingMarket(lang)}&count=6&textDecorations=false&textFormat=Raw`,
+        {
+          headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
+          signal: controller.signal,
+        }
+      );
+
+      clearTimeout(timeout);
+
+      if (!res.ok) return [];
+
+      const json = await res.json();
+      const items = (json.webPages && json.webPages.value) || [];
+      return items.map((x) => ({
+        name: x.name,
+        url: x.url,
+        snippet: x.snippet,
+      }));
+    }
+  } catch (_) {}
+
+  return [];
+}
+
+function judgeSearchResultsAgainstClaim(claim, results, lang) {
+  const lowerClaim = String(claim || "").toLowerCase();
+  const tokens = claimTokens(lowerClaim);
+
+  const roleShiftCues = [
+    "former",
+    "ex-",
+    "ex ",
+    "previous",
+    "past",
+    "ancien",
+    "ancienne",
+    "précédent",
+    "précédente",
+    "ex-président",
+    "ancien président",
+    "быв",
+  ];
+
+  const claimHasNegation = containsNegation(lowerClaim, lang);
+
+  let support = 0;
+  let contradict = 0;
+
+  const scored = (results || []).map((r) => {
+    const blob = `${r.name || ""} ${r.snippet || ""}`.toLowerCase();
+    const tokenHits = tokens.filter((t) => t.length >= 4 && blob.includes(t)).length;
+
+    const hasNeg = containsNegation(` ${blob} `, lang);
+    const hasRoleShift = roleShiftCues.some((c) => blob.includes(c));
+
+    // Heuristic:
+    // - If claim contains negation, snippets with negation may support it (but stay conservative).
+    // - Otherwise, snippets with negation may contradict (again conservative).
+    if (!claimHasNegation && hasNeg) contradict += 1;
+    if (claimHasNegation && hasNeg) support += 1;
+
+    // Politics: "former" cues contradict "current" claims
+    if (hasRoleShift) contradict += 1;
+
+    // More token hits suggests relevance, used to weight
+    if (tokenHits >= 3) support += 1;
+    if (tokenHits === 0) {
+      // irrelevant snippet should not influence too much
+    }
+
+    return {
+      ...r,
+      tokenHits,
+      hasNeg,
+      hasRoleShift,
+    };
+  });
+
+  // Conservative judgement:
+  // Need a clear margin to decide; otherwise uncertain/mixed
+  const total = support + contradict;
+
+  let label = "uncertain";
+  if (total >= 3) {
+    if (support >= contradict + 2) label = "support";
+    else if (contradict >= support + 2) label = "contradict";
+    else label = "mixed";
+  } else {
+    label = "uncertain";
+  }
+
+  return {
+    label,
+    support,
+    contradict,
+    results: cleanSources(scored),
+  };
+}
+
+// --------------------------
+// Scoring (multi-signal)
+// --------------------------
+
+function scoreTextSignals(text, lang) {
+  const tlen = safeLen(text);
+  const lower = safeLower(text);
+
+  let score = 78;
+  const reasons = [];
+  const meta = { signals: [] };
+
+  // Length signals
+  if (tlen < 40) {
+    score -= 18;
+    reasons.push("sig_no_claims");
+    meta.signals.push({ k: "length", v: "very_short" });
+  } else if (tlen < 120) {
+    score -= 6;
+    meta.signals.push({ k: "length", v: "short" });
+  } else {
+    meta.signals.push({ k: "length", v: "ok" });
+  }
+
+  // Uppercase ratio (Latin only)
+  const letters = (text.match(/[A-Za-zÀ-ÿ]/g) || []).length;
+  const uppers = (text.match(/[A-ZÀÂÄÇÉÈÊËÎÏÔÖÙÛÜŸ]/g) || []).length;
+  const ratio = letters ? uppers / letters : 0;
+
+  if (ratio > 0.22 && letters > 60) {
+    score -= 6;
+    reasons.push("sig_caps");
+    meta.signals.push({ k: "caps_ratio", v: ratio.toFixed(2) });
+  }
+
+  // All-caps words
+  const allCapsWords = (text.match(/\b[A-Z]{4,}\b/g) || []).length;
+  if (allCapsWords >= 2) {
+    score -= 7;
+    reasons.push("sig_allcaps");
+    meta.signals.push({ k: "allcaps_words", v: allCapsWords });
+  }
+
+  // Exclamation marks
+  const ex = (text.match(/!/g) || []).length;
+  if (ex >= 4) {
+    score -= 5;
+    reasons.push("sig_exclam");
+    meta.signals.push({ k: "exclamations", v: ex });
+  }
+
+  // Links
+  const links = (text.match(/https?:\/\/\S+/g) || []).length;
+  if (links >= 3) {
+    score -= 4;
+    reasons.push("sig_many_links");
+    meta.signals.push({ k: "links", v: links });
+  }
+
+  // Claims density
+  const claims = extractClaims(text);
+  if (claims.length === 0) {
+    score -= 10;
+    reasons.push("sig_no_claims");
+    meta.signals.push({ k: "claims", v: 0 });
+  } else if (claims.length >= 3) {
+    score -= 5;
+    reasons.push("sig_many_claims");
+    meta.signals.push({ k: "claims", v: claims.length });
+  } else {
+    reasons.push("sig_some_claims");
+    meta.signals.push({ k: "claims", v: claims.length });
+  }
+
+  // Time sensitive hints
+  const timeSensitive = topicMatch(lower, lang, langKeywords(lang, "time_words"));
+  if (timeSensitive) {
+    score -= 4;
+    reasons.push("sig_time_sensitive");
+    meta.signals.push({ k: "time_sensitive", v: true });
+  }
+
+  score = clamp(score, 5, 98);
+
+  return { score, reasons, meta, claims };
+}
+
+function riskFromScore(score) {
+  if (score >= 80) return "low";
+  if (score >= 55) return "medium";
+  return "high";
+}
+
+// --------------------------
+// Main analyze route
+// --------------------------
+
+app.get("/v1/analyze", (_, res) => {
+  res.json({
+    status: "ok",
+    engine: ENGINE_NAME,
+    mode: "info",
+    result: { score: 0, riskLevel: "low", summary: "Use POST /v1/analyze", reasons: [], confidence: 1, sources: [] },
+    meta: { tookMs: 0, version: ENGINE_VERSION },
+  });
+});
+
+app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
+  const started = Date.now();
+
+  const tier = (req.headers["x-tier"] || "standard").toString().toLowerCase();
+  const uiLang = normalizeLang(req.headers["x-lang"]);
+  const text = (req.body && req.body.text) || "";
+
+  if (!text || !String(text).trim()) {
+    return res.status(400).json({
+      status: "error",
+      requestId: requestId(),
+      engine: ENGINE_NAME,
+      mode: tier,
+      result: {
+        score: 25,
+        riskLevel: "high",
+        summary: "Missing 'text'.",
+        reasons: ["Provide text in JSON body: { text: '...' }"],
+        confidence: 0.5,
+        sources: [],
+      },
+      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
+    });
+  }
+
+  const detected = detectLanguage(text);
+  const lang = uiLang || detected || "en";
+
+  try {
+    const signals = scoreTextSignals(text, lang);
+    let score = signals.score;
+    let reasons = signals.reasons.map((k) => t(lang, k));
+    let sources = [];
+    let confidence = tier === "pro" || tier === "premium" || tier === "premium_plus" ? 0.8 : 0.62;
+
+    const isPro = tier === "pro" || tier === "premium" || tier === "premium_plus";
+
+    let webLabel = "none";
+    let webSummaryKey = null;
+
+    if (isPro) {
+      if (!BING_API_KEY || WEB_PROVIDER !== "bing") {
+        // No provider configured
+        reasons.unshift(t(lang, "sig_pro_no_web"));
+        confidence = 0.66;
+      } else {
+        const verified = await verifyClaimsWithWeb(signals.claims, lang);
+
+        // Aggregate judgement
+        let supports = 0;
+        let contradicts = 0;
+        let mixed = 0;
+        let uncertain = 0;
+
+        const gathered = [];
+        for (const v of verified) {
+          const j = v.judged;
+          if (j.label === "support") supports += 1;
+          else if (j.label === "contradict") contradicts += 1;
+          else if (j.label === "mixed") mixed += 1;
+          else uncertain += 1;
+
+          for (const r of j.results || []) gathered.push(r);
+        }
+
+        sources = cleanSources(gathered);
+
+        // Conservative web label
+        if (supports >= 2 && contradicts === 0) webLabel = "support";
+        else if (contradicts >= 2 && supports === 0) webLabel = "contradict";
+        else if (supports + contradicts + mixed >= 2) webLabel = "mixed";
+        else webLabel = "uncertain";
+
+        if (webLabel === "support") {
+          score = clamp(score + 8, 5, 98);
+          confidence = 0.86;
+          reasons.unshift(t(lang, "sig_web_support"));
+          webSummaryKey = "summary_pro_supported";
+        } else if (webLabel === "contradict") {
+          score = clamp(score - 14, 5, 98);
+          confidence = 0.84;
+          reasons.unshift(t(lang, "sig_web_contradict"));
+          webSummaryKey = "summary_pro_contradicted";
+        } else if (webLabel === "mixed") {
+          score = clamp(score - 6, 5, 98);
+          confidence = 0.78;
+          reasons.unshift(t(lang, "sig_web_mixed"));
+          webSummaryKey = "summary_pro_uncertain";
+        } else {
+          score = clamp(score - 4, 5, 98);
+          confidence = 0.72;
+          reasons.unshift(t(lang, "sig_web_uncertain"));
+          webSummaryKey = "summary_pro_uncertain";
+        }
+      }
+    }
+
+    const risk = riskFromScore(score);
+    const top = reasons[0] || t(lang, "no_reasons");
+
+    const summaryTpl = isPro
+      ? t(lang, webSummaryKey || "summary_pro_uncertain")
+      : t(lang, "summary_standard");
+
+    const summary = formatTemplate(summaryTpl, { risk, top });
+
+    const response = {
+      status: "ok",
+      requestId: requestId(),
+      engine: ENGINE_NAME,
+      mode: isPro ? "pro" : "standard",
+      result: {
+        score,
+        riskLevel: risk,
+        summary,
+        reasons: uniqBy(reasons, (x) => x).slice(0, 8),
+        confidence: clamp(confidence, 0.5, 0.95),
+        sources: cleanSources(sources),
+      },
+      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
+    };
+
+    return res.json(response);
+  } catch (err) {
+    return res.status(500).json({
+      status: "error",
+      requestId: requestId(),
+      engine: ENGINE_NAME,
+      mode: tier,
+      result: {
+        score: 25,
+        riskLevel: "high",
+        summary: t(lang, "server_error_summary"),
+        reasons: [t(lang, "server_error_reason")],
+        confidence: 0.55,
+        sources: [],
+      },
+      meta: { tookMs: Date.now() - started, version: ENGINE_VERSION },
+    });
+  }
+});
 
 // --------------------------
 // Start
 // --------------------------
 
+const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`[IA11] listening on ${PORT} — v${ENGINE_VERSION}`);
+  console.log(`[IA11] listening on :${PORT} — version ${ENGINE_VERSION}`);
 });

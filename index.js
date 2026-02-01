@@ -135,7 +135,7 @@ function clamp(n, min, max) {
 
 async function webSearch(query) {
   if (SEARCH_PROVIDER === "bing" && BING_API_KEY) {
-    const res = await fetch(
+    const res = await fetchPro(
       `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&recency=365`,
       {
         headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
@@ -152,7 +152,7 @@ async function webSearch(query) {
   }
 
   if (SEARCH_PROVIDER === "serper" && SERPER_API_KEY) {
-    const res = await fetch(SERPER_ENDPOINT, {
+    const res = await fetchPro(SERPER_ENDPOINT, {
       method: "POST",
       headers: {
         "X-API-KEY": SERPER_API_KEY,

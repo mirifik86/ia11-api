@@ -134,6 +134,10 @@ function clamp(n, min, max) {
 /* ================= SEARCH ================= */
 
 async function webSearch(query) {
+    console.log("[IA11] webSearch() provider =", SEARCH_PROVIDER);
+    console.log("[IA11] SERPER_API_KEY present =", !!SERPER_API_KEY);
+    console.log("[IA11] BING_API_KEY present =", !!BING_API_KEY);
+
   if (SEARCH_PROVIDER === "bing" && BING_API_KEY) {
     const res = await fetchPro(
       `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&recency=365`,

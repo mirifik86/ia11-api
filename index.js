@@ -8,44 +8,95 @@
  * - Language-safe (matches UI language)
  * - Defensive & Render-safe
  */
-
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+/**
+ * ================= FETCH PRO (stable + timeout + retry) =================
+ * Évite les blocages réseau et rend la recherche web fiable en prod
+ */
+const baseFetch = global.fetch
+  ? global.fetch.bind(global)
+  : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchPro(url, options = {}, cfg = {}) {
+  const timeoutMs = Number(cfg.timeoutMs ?? 9000);
+  const retries = Number(cfg.retries ?? 1);
+  const retryDelayMs = Number(cfg.retryDelayMs ?? 500);
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await Promise.race([
+        baseFetch(url, options),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Fetch timeout")), timeoutMs)
+        ),
+      ]);
+
+      if (!res.ok && attempt < retries && [429, 500, 502, 503, 504].includes(res.status)) {
+        await sleep(retryDelayMs * (attempt + 1));
+        continue;
+      }
+
+      return res;
+    } catch (err) {
+      if (attempt < retries) {
+        await sleep(retryDelayMs * (attempt + 1));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-/* ================= CONFIG ================= */
+/* ================== CONFIG ================== */
 
 const ENGINE_NAME = "IA11";
 const VERSION = "2.1.0-ultra-pro";
 
-const IA11_API_KEY = process.env.IA11_API_KEY || "";
+const IA11_API_KEY = String(process.env.IA11_API_KEY || "").trim();
 if (!IA11_API_KEY) {
-  console.error("❌ IA11_API_KEY missing");
-  process.exit(1);
+  throw new Error("IA11_API_KEY missing (required in Render env)");
 }
 
+// Rate limits
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 60);
 const RATE_LIMIT_PER_MIN_PRO = Number(process.env.RATE_LIMIT_PER_MIN_PRO || 30);
 
 // Search providers
-const BING_API_KEY = process.env.BING_API_KEY || "";
+const BING_API_KEY = String(process.env.BING_API_KEY || "").trim();
 const BING_ENDPOINT =
-  process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search";
+  String(process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search").trim();
 
-const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
+const SERPER_API_KEY = String(process.env.SERPER_API_KEY || "").trim();
 const SERPER_ENDPOINT =
-  process.env.SERPER_ENDPOINT || "https://google.serper.dev/search";
+  String(process.env.SERPER_ENDPOINT || "https://google.serper.dev/search").trim();
 
 const SEARCH_PROVIDER = (
-  process.env.SEARCH_PROVIDER ||
+  String(process.env.SEARCH_PROVIDER || "").trim() ||
   (SERPER_API_KEY ? "serper" : BING_API_KEY ? "bing" : "none")
 ).toLowerCase();
+
+if (SEARCH_PROVIDER === "none") {
+  console.warn("⚠️ No search provider configured → Web corroboration disabled.");
+}
+
+if (SEARCH_PROVIDER === "serper" && !SERPER_API_KEY) {
+  throw new Error("SEARCH_PROVIDER=serper but SERPER_API_KEY missing");
+}
+
+if (SEARCH_PROVIDER === "bing" && !BING_API_KEY) {
+  throw new Error("SEARCH_PROVIDER=bing but BING_API_KEY missing");
+}
+
+
 
 /* ================= RATE LIMIT ================= */
 

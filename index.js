@@ -711,12 +711,25 @@ function computeProScoreBase({ text, claims, evidenceItems, lang }) {
 }
 
 function buildKeyPointsFromBuckets(buckets, hasContradiction) {
-  // simple UX-friendly counts
-  const confirmed = (buckets.corroborate || []).length ? 1 : 0;
-  const contradicted = hasContradiction ? 1 : 0;
-  const uncertain = contradicted ? 0 : (confirmed ? 0 : 1);
-  return { confirmed, uncertain, contradicted };
+  // IMPORTANT:
+  // - "INCERTAIN" must NEVER be used as a fallback when there are ZERO sources.
+  // - If no sources were found/returned, UI must show 0/0/0 and label it as "vérification limitée".
+  const b = buckets || { corroborate: [], contradict: [], neutral: [] };
+  const total =
+    (b.corroborate || []).length + (b.contradict || []).length + (b.neutral || []).length;
+
+  if (total === 0) {
+    return { confirmed: 0, uncertain: 0, contradicted: 0, limited: true };
+  }
+
+  // If we have sources, we can show a simple signal:
+  const confirmed = (b.corroborate || []).length ? 1 : 0;
+  const contradicted = hasContradiction || (b.contradict || []).length ? 1 : 0;
+  const uncertain = contradicted || confirmed ? 0 : 1;
+
+  return { confirmed, uncertain, contradicted, limited: false };
 }
+
 
 // -------------------- ROUTES --------------------
 app.get("/", (req, res) => {
@@ -757,7 +770,7 @@ app.post("/v1/analyze", async (req, res) => {
         confidence: 0.2,
         sources: [],
         sourcesBuckets: bucketSources([]),
-        keyPoints: { confirmed: 0, uncertain: 1, contradicted: 0 },
+        keyPoints: { confirmed: 0, uncertain: 0, contradicted: 0, limited: true },
         verifiedFacts: [],
         corrections: [],
       },
@@ -781,7 +794,7 @@ app.post("/v1/analyze", async (req, res) => {
         confidence: 0.2,
         sources: [],
         sourcesBuckets: bucketSources([]),
-        keyPoints: { confirmed: 0, uncertain: 1, contradicted: 0 },
+        keyPoints: { confirmed: 0, uncertain: 0, contradicted: 0, limited: true },
         verifiedFacts: [],
         corrections: [],
       },
@@ -796,7 +809,7 @@ app.post("/v1/analyze", async (req, res) => {
   const text = safeStr(req.body?.text).trim();
   const mode =
     safeStr(req.body?.mode).toLowerCase() || (isPro ? "pro" : "standard");
-  const forcedLang = safeStr(req.body?.lang).trim().toLowerCase();
+  const forcedLang = safeStr(req.body?.uiLanguage || req.body?.lang || req.body?.language).trim().toLowerCase();
   const lang = forcedLang === "fr" || forcedLang === "en" ? forcedLang : detectLikelyLang(text);
 
   if (!text) {
@@ -813,7 +826,7 @@ app.post("/v1/analyze", async (req, res) => {
         confidence: 0.2,
         sources: [],
         sourcesBuckets: bucketSources([]),
-        keyPoints: { confirmed: 0, uncertain: 1, contradicted: 0 },
+        keyPoints: { confirmed: 0, uncertain: 0, contradicted: 0, limited: true },
         verifiedFacts: [],
         corrections: [],
       },
@@ -849,7 +862,7 @@ app.post("/v1/analyze", async (req, res) => {
         confidence: 0.2,
         sources: [],
         sourcesBuckets: bucketSources([]),
-        keyPoints: { confirmed: 0, uncertain: 1, contradicted: 0 },
+        keyPoints: { confirmed: 0, uncertain: 0, contradicted: 0, limited: true },
         verifiedFacts: [],
         corrections: [],
       },
@@ -888,12 +901,26 @@ async function analyze({ text, mode, lang, requestId }) {
       result: {
         score: s.score,
         riskLevel: s.riskLevel,
+        statusKey: s.keyPoints?.limited ? "LIMITE" : (s.keyPoints?.contradicted ? "CONTREDIT" : (s.keyPoints?.confirmed ? "CONFIRME" : (s.keyPoints?.uncertain ? "INCERTAIN" : "LIMITE"))),
+        statusLabel: lang === "fr"
+          ? (s.keyPoints?.limited ? "ÉVALUATION LIMITÉE" : (s.keyPoints?.contradicted ? "CONTREDIT" : (s.keyPoints?.confirmed ? "CONFIRMÉ" : "INCERTAIN")))
+          : (s.keyPoints?.limited ? "LIMITED EVALUATION" : (s.keyPoints?.contradicted ? "CONTRADICTED" : (s.keyPoints?.confirmed ? "CONFIRMED" : "UNCERTAIN"))),
+        badgeText: lang === "fr"
+          ? (s.keyPoints?.limited ? "Vérification limitée disponible" : (s.keyPoints?.contradicted ? "Contredit par des sources fiables" : (s.keyPoints?.confirmed ? "Confirmé par des sources fiables" : "Conclusions contradictoires entre sources")))
+          : (s.keyPoints?.limited ? "Limited verification available" : (s.keyPoints?.contradicted ? "Contradicted by reliable sources" : (s.keyPoints?.confirmed ? "Confirmed by reliable sources" : "Conflicting conclusions across sources"))),
+
+        statusKey: s.keyPoints?.limited ? "LIMITE" : (s.keyPoints?.contradicted ? "CONTREDIT" : (s.keyPoints?.confirmed ? "CONFIRME" : (s.keyPoints?.uncertain ? "INCERTAIN" : "LIMITE"))),
+        statusLabel: lang === "fr" ? (s.keyPoints?.limited ? "ÉVALUATION LIMITÉE" : (s.keyPoints?.contradicted ? "CONTREDIT" : (s.keyPoints?.confirmed ? "CONFIRMÉ" : "INCERTAIN"))) : (s.keyPoints?.limited ? "LIMITED EVALUATION" : (s.keyPoints?.contradicted ? "CONTRADICTED" : (s.keyPoints?.confirmed ? "CONFIRMED" : "UNCERTAIN"))),
+        badgeText: lang === "fr" ? (s.keyPoints?.limited ? "Vérification limitée disponible" : (s.keyPoints?.contradicted ? "Contredit par des sources fiables" : (s.keyPoints?.confirmed ? "Confirmé par des sources fiables" : "Conclusions contradictoires entre sources"))) : (s.keyPoints?.limited ? "Limited verification available" : (s.keyPoints?.contradicted ? "Contradicted by reliable sources" : (s.keyPoints?.confirmed ? "Confirmed by reliable sources" : "Conflicting conclusions across sources"))),
+        counters: { confirmedCount: s.keyPoints?.confirmed || 0, uncertainCount: s.keyPoints?.uncertain || 0, contradictedCount: s.keyPoints?.contradicted || 0 },
         summary: s.summary,
         reasons: s.reasons.slice(0, 10),
         confidence: s.confidence,
         sources: s.sources,
         sourcesBuckets: s.sourcesBuckets,
         keyPoints: s.keyPoints,
+      counters: { confirmedCount: keyPoints.confirmed, uncertainCount: keyPoints.uncertain, contradictedCount: keyPoints.contradicted },
+        counters: { confirmedCount: s.keyPoints.confirmed, uncertainCount: s.keyPoints.uncertain, contradictedCount: s.keyPoints.contradicted },
         verifiedFacts: [],
         corrections: [],
         meta: {
@@ -998,6 +1025,14 @@ async function analyze({ text, mode, lang, requestId }) {
     result: {
       score,
       riskLevel,
+      statusKey: keyPoints?.limited ? "LIMITE" : (keyPoints?.contradicted ? "CONTREDIT" : (keyPoints?.confirmed ? "CONFIRME" : (keyPoints?.uncertain ? "INCERTAIN" : "LIMITE"))),
+      statusLabel: lang === "fr"
+        ? (keyPoints?.limited ? "ÉVALUATION LIMITÉE" : (keyPoints?.contradicted ? "CONTREDIT" : (keyPoints?.confirmed ? "CONFIRMÉ" : "INCERTAIN")))
+        : (keyPoints?.limited ? "LIMITED EVALUATION" : (keyPoints?.contradicted ? "CONTRADICTED" : (keyPoints?.confirmed ? "CONFIRMED" : "UNCERTAIN"))),
+      badgeText: lang === "fr"
+        ? (keyPoints?.limited ? "Vérification limitée disponible" : (keyPoints?.contradicted ? "Contredit par des sources fiables" : (keyPoints?.confirmed ? "Confirmé par des sources fiables" : "Conclusions contradictoires entre sources")))
+        : (keyPoints?.limited ? "Limited verification available" : (keyPoints?.contradicted ? "Contradicted by reliable sources" : (keyPoints?.confirmed ? "Confirmed by reliable sources" : "Conflicting conclusions across sources"))),
+
       summary,
       reasons: reasons.slice(0, 12),
       confidence,

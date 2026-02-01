@@ -91,6 +91,20 @@ try {
 
 // ---- In-memory rate limiter
 const buckets = new Map(); // key -> { windowStartMs, countStd, countPro }
+// Prevent memory growth: purge old rate-limit buckets (IPs that disappeared)
+const BUCKET_TTL_MS = 10 * 60_000; // 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of buckets.entries()) {
+    if (!v || !v.windowStartMs) {
+      buckets.delete(k);
+      continue;
+    }
+    // if bucket hasn't been used for TTL, delete it
+    if (now - v.windowStartMs > BUCKET_TTL_MS) buckets.delete(k);
+  }
+}, 60_000).unref();
+
 
 // -------------------- helpers
 function nowMs() {

@@ -809,6 +809,40 @@ app.post("/v1/analyze", async (req, res) => {
   }
 
   const text = safeStr(req.body?.text).trim();
+  // --- WEB SEARCH (SERPER) ---
+let sources = [];
+
+if (process.env.SEARCH_PROVIDER === "serper" && process.env.SERPER_API_KEY && text) {
+  try {
+    const fetch = (...args) =>
+      import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+    const response = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: {
+        "X-API-KEY": process.env.SERPER_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        q: text,
+        num: 5
+      })
+    });
+
+    const data = await response.json();
+
+    if (Array.isArray(data.organic)) {
+      sources = data.organic.map(r => ({
+        title: r.title,
+        link: r.link,
+        snippet: r.snippet
+      }));
+    }
+  } catch (err) {
+    console.error("Serper search failed", err);
+  }
+}
+
   const mode =
     safeStr(req.body?.mode).toLowerCase() || (isPro ? "pro" : "standard");
   const forcedLang = safeStr(req.body?.uiLanguage || req.body?.lang || req.body?.language).trim().toLowerCase();

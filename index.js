@@ -34,6 +34,11 @@ const BING_API_KEY = process.env.BING_API_KEY || "";
 const BING_ENDPOINT =
   process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search";
 
+// --- WEB SEARCH PROVIDERS ---
+const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
+const SEARCH_PROVIDER = (process.env.SEARCH_PROVIDER || (SERPER_API_KEY ? "serper" : (BING_API_KEY ? "bing" : "none"))).toLowerCase();
+
+
 // Optional: stricter guardrail list (OFF unless you provide CRITICAL_FACTS_JSON)
 let CRITICAL_FACTS = [];
 try {
@@ -739,7 +744,7 @@ app.get("/", (req, res) => {
     status: "ready",
     message: "Use POST /v1/analyze with x-ia11-key header",
     engine: ENGINE_NAME,
-    webEvidenceProvider: BING_API_KEY ? "bing" : "none",
+    webEvidenceProvider: (SEARCH_PROVIDER === "serper" && SERPER_API_KEY) ? "serper" : (SEARCH_PROVIDER === "bing" && BING_API_KEY) ? "bing" : "none",
   });
 });
 
@@ -748,7 +753,7 @@ app.get("/v1/analyze", (req, res) => {
     status: "IA11 engine running",
     engine: ENGINE_NAME,
     version: VERSION,
-    webEvidenceProvider: BING_API_KEY ? "bing" : "none",
+    webEvidenceProvider: (SEARCH_PROVIDER === "serper" && SERPER_API_KEY) ? "serper" : (SEARCH_PROVIDER === "bing" && BING_API_KEY) ? "bing" : "none",
   });
 });
 
@@ -809,39 +814,49 @@ app.post("/v1/analyze", async (req, res) => {
   }
 
   const text = safeStr(req.body?.text).trim();
-  // --- WEB SEARCH (SERPER) ---
-let sources = [];
-
-if (process.env.SEARCH_PROVIDER === "serper" && process.env.SERPER_API_KEY && text) {
+  // --- WEB SEARCH (SERPER or BING) ---
+  let sources = [];
   try {
-    const fetch = (...args) =>
-      import("node-fetch").then(({ default: fetch }) => fetch(...args));
-
-    const response = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": process.env.SERPER_API_KEY,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        q: text,
-        num: 5
-      })
-    });
-
-    const data = await response.json();
-
-    if (Array.isArray(data.organic)) {
-      sources = data.organic.map(r => ({
-        title: r.title,
-        link: r.link,
-        snippet: r.snippet
-      }));
+    if (text) {
+      if (SEARCH_PROVIDER === "serper" && SERPER_API_KEY) {
+        const response = await fetch("https://google.serper.dev/search", {
+          method: "POST",
+          headers: {
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ q: text, num: 5 }),
+        });
+        const data = await response.json();
+        if (Array.isArray(data?.organic)) {
+          sources = data.organic.slice(0, 5).map((r) => ({
+            title: r.title,
+            link: r.link,
+            snippet: r.snippet,
+          }));
+        }
+      } else if (SEARCH_PROVIDER === "bing" && BING_API_KEY) {
+        const url = `${BING_ENDPOINT}?q=${encodeURIComponent(text)}&count=5&mkt=en-US&safeSearch=Moderate`; 
+        const response = await fetch(url, {
+          headers: {
+            "Ocp-Apim-Subscription-Key": BING_API_KEY,
+          },
+        });
+        const data = await response.json();
+        const items = data?.webPages?.value;
+        if (Array.isArray(items)) {
+          sources = items.slice(0, 5).map((r) => ({
+            title: r.name,
+            link: r.url,
+            snippet: r.snippet,
+          }));
+        }
+      }
     }
   } catch (err) {
-    console.error("Serper search failed", err);
+    console.error("Web search failed", err);
+    sources = [];
   }
-}
 
   const mode =
     safeStr(req.body?.mode).toLowerCase() || (isPro ? "pro" : "standard");

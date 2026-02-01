@@ -13,9 +13,9 @@
  * - POST /v1/analyze       -> main analysis (protected by x-ia11-key)
  */
 
-import express from "express";
-import cors from "cors";
-import crypto from "crypto";
+const express = require("express");
+const cors = require("cors");
+const crypto = require("crypto"); // 
 
 const app = express();
 app.use(cors());

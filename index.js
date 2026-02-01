@@ -192,6 +192,12 @@ app.get("/", (req, res) => {
 });
 
 app.post("/v1/analyze", async (req, res) => {
+  // --- IA11 SCORE BASE (1–99) ---
+let score = 50; // neutral base
+
+// Helper clamp
+const clamp = (num, min, max) => Math.min(Math.max(num, min), max);
+
   const key = req.headers["x-ia11-key"];
   if (key !== IA11_API_KEY) {
     return res.status(401).json({ status: "error", message: "Unauthorized" });

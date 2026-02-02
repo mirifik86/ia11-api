@@ -25,13 +25,17 @@ function uid() {
 function requireKey(req, res, next) {
   const key = req.header("x-ia11-key");
 
-  // Allow calls from your Lovable frontend without key
   const origin = req.headers.origin || "";
-  if (origin.includes("lovable") || origin.includes("leenscore")) {
-    return next();
-  }
+  const referer = req.headers.referer || "";
 
-  // Otherwise require API key (for private/pro use later)
+  const allowedFrontend =
+    origin.includes("lovable.app") ||
+    origin.includes("leenscore.com") ||
+    referer.includes("lovable.app") ||
+    referer.includes("leenscore.com");
+
+  if (allowedFrontend) return next();
+
   if (!API_KEY || key !== API_KEY) {
     return res.status(401).json({
       status: "error",
@@ -41,6 +45,7 @@ function requireKey(req, res, next) {
 
   next();
 }
+
 
 
 // Very simple in-memory rate limiter (good enough for now)

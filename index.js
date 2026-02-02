@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -8,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const ENGINE = "IA11";
 const API_KEY = process.env.IA11_API_KEY || "";
 const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
@@ -64,6 +63,34 @@ function rateLimit(req, res, next) {
   next();
 }
 
+// -------- URL sanitizer (fixes "pattern" issues in UI) --------
+function isValidHttpUrl(u) {
+  if (!u || typeof u !== "string") return false;
+  const s = u.trim();
+  return s.startsWith("http://") || s.startsWith("https://");
+}
+
+function cleanSources(items) {
+  // Keep only sources with valid http/https URLs
+  const cleaned = (Array.isArray(items) ? items : [])
+    .map((it) => ({
+      title: (it?.title || "").toString().trim(),
+      url: (it?.url || "").toString().trim(),
+      snippet: (it?.snippet || "").toString().trim(),
+    }))
+    .filter((it) => isValidHttpUrl(it.url));
+
+  // De-dup by url
+  const seen = new Set();
+  const uniq = [];
+  for (const s of cleaned) {
+    if (seen.has(s.url)) continue;
+    seen.add(s.url);
+    uniq.push(s);
+  }
+  return uniq.slice(0, 8);
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -82,10 +109,13 @@ app.get("/v1/analyze", (req, res) => {
   });
 });
 
-async function serperSearch(query) {
+async function serperSearch(query, uiLanguage) {
   if (!SERPER_API_KEY) {
     return { ok: false, items: [], error: "Missing SERPER_API_KEY" };
   }
+
+  const hl = uiLanguage === "en" ? "en" : "fr"; // keep simple for now
+  const gl = "ca";
 
   const r = await fetch("https://google.serper.dev/search", {
     method: "POST",
@@ -96,8 +126,8 @@ async function serperSearch(query) {
     body: JSON.stringify({
       q: query,
       num: 8,
-      gl: "ca",
-      hl: "fr",
+      gl,
+      hl,
     }),
   });
 
@@ -119,9 +149,6 @@ async function serperSearch(query) {
 }
 
 function buildHeuristicScore(text, sourcesCount) {
-  // Baseline simple mais pas débile:
-  // - texte trop court => score bas
-  // - un peu de sources => monte la confiance
   const len = text.trim().length;
 
   let score = 50;
@@ -147,8 +174,6 @@ function buildHeuristicScore(text, sourcesCount) {
 }
 
 function makeSummary(text, sources, mode) {
-  // Résumé simple: on ne "déclare" pas une vérité absolue.
-  // On parle en termes de "signaux" + "à confirmer".
   const base =
     mode === "pro"
       ? "Analyse PRO : signaux croisés + recherche web."
@@ -160,14 +185,16 @@ function makeSummary(text, sources, mode) {
     `Conclusion: à valider avec des sources fiables et le contexte complet.`;
 }
 
-function makeReasons(text, sources, mode) {
+function makeReasons(text, sources, mode, searchOk, searchError) {
   const reasons = [];
 
   const len = text.trim().length;
   if (len < 40) reasons.push("Le texte est très court : risque de contexte manquant.");
   else reasons.push("Le texte contient assez de matière pour analyse (contexte minimal).");
 
-  if (sources.length === 0) {
+  if (!searchOk) {
+    reasons.unshift(`Recherche web indisponible: ${searchError || "unknown"}`);
+  } else if (sources.length === 0) {
     reasons.push("Aucune source web claire trouvée via Serper (requête trop vague ou info peu documentée).");
   } else {
     reasons.push("Présence de sources web : on peut croiser et comparer.");
@@ -189,6 +216,7 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
 
   const text = (req.body?.text || "").toString();
   const mode = (req.body?.mode === "pro") ? "pro" : "standard";
+  const uiLanguage = (req.body?.uiLanguage || "fr").toString().toLowerCase();
 
   if (!text.trim()) {
     return res.status(400).json({
@@ -201,31 +229,30 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
   // Build a search query: keep it simple and robust
   const q = text.trim().slice(0, 240);
 
+  let rawSources = [];
   let sources = [];
   let searchOk = false;
   let searchError = null;
 
   try {
-    const out = await serperSearch(q);
+    const out = await serperSearch(q, uiLanguage);
     searchOk = out.ok;
-    sources = out.items || [];
+    rawSources = out.items || [];
     searchError = out.error || null;
   } catch (e) {
     searchOk = false;
     searchError = e?.message || "Unknown search error";
   }
 
-  // Score (heuristic today, can be upgraded later)
+  // IMPORTANT: sanitize sources to avoid invalid URL patterns that break UI
+  sources = cleanSources(rawSources);
+
+  // Score
   const { score, confidence, riskLevel } = buildHeuristicScore(text, sources.length);
   const summary = makeSummary(text, sources, mode);
-  const reasons = makeReasons(text, sources, mode);
+  const reasons = makeReasons(text, sources, mode, searchOk, searchError);
 
   const tookMs = nowMs() - t0;
-
-  // If Serper is missing, we still return a valid result but warn via reasons
-  if (!searchOk) {
-    reasons.unshift(`Recherche web indisponible: ${searchError || "unknown"}`);
-  }
 
   return res.json({
     status: "ok",
@@ -239,8 +266,14 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
       reasons,
       confidence,
       sources,
+      // optional helper for UI sections that want "best links"
+      bestLinks: sources.map((s) => ({ title: s.title, url: s.url })),
     },
-    meta: { tookMs, version: VERSION },
+    meta: {
+      tookMs,
+      version: VERSION,
+      webSearchUsed: searchOk && sources.length > 0,
+    },
   });
 });
 

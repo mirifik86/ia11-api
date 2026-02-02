@@ -86,6 +86,9 @@ const SEARCH_PROVIDER = (
 
 if (SEARCH_PROVIDER === "none") {
   console.warn("⚠️ No search provider configured → Web corroboration disabled.");
+  console.log("🔎 IA11 Search Provider:", SEARCH_PROVIDER);
+  console.log("🔎 SERPER KEY LOADED:", !!SERPER_API_KEY);
+
 }
 
 if (SEARCH_PROVIDER === "serper" && !SERPER_API_KEY) {
@@ -271,7 +274,10 @@ const clamp = (num, min, max) => Math.min(Math.max(num, min), max);
   const requestId = uid();
   const started = Date.now();
 
+  console.log("🧠 Starting web search for:", text);
   const rawSources = await webSearch(text);
+  console.log("🧠 Web search returned", rawSources.length, "sources");
+
   const sources = rawSources.map((s) => ({
     title: s.title,
     url: s.url,

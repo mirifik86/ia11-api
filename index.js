@@ -1,318 +1,250 @@
-/**
- * IA11 — Credibility Intelligence Engine
- * Ultra PRO Production Build for LeenScore
- *
- * - Single analysis brain (Lovable UI stays untouched)
- * - Real web verification (Bing or Serper)
- * - Strict PRO output contract
- * - Language-safe (matches UI language)
- * - Defensive & Render-safe
- */
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 
-/**
- * ================= FETCH PRO (stable + timeout + retry) =================
- * Évite les blocages réseau et rend la recherche web fiable en prod
- */
-const baseFetch = global.fetch
-  ? global.fetch.bind(global)
-  : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function fetchPro(url, options = {}, cfg = {}) {
-  const timeoutMs = Number(cfg.timeoutMs ?? 9000);
-  const retries = Number(cfg.retries ?? 1);
-  const retryDelayMs = Number(cfg.retryDelayMs ?? 500);
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const res = await Promise.race([
-        baseFetch(url, options),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Fetch timeout")), timeoutMs)
-        ),
-      ]);
-
-      if (!res.ok && attempt < retries && [429, 500, 502, 503, 504].includes(res.status)) {
-        await sleep(retryDelayMs * (attempt + 1));
-        continue;
-      }
-
-      return res;
-    } catch (err) {
-      if (attempt < retries) {
-        await sleep(retryDelayMs * (attempt + 1));
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-/* ================== CONFIG ================== */
+const VERSION = "1.0.0";
+const ENGINE = "IA11";
+const API_KEY = process.env.IA11_API_KEY || "";
+const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
 
-const ENGINE_NAME = "IA11";
-const VERSION = "2.1.0-ultra-pro";
+const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 30);
+const RATE_LIMIT_PER_MIN_PRO = Number(process.env.RATE_LIMIT_PER_MIN_PRO || 120);
 
-const IA11_API_KEY = String(process.env.IA11_API_KEY || "").trim();
-if (!IA11_API_KEY) {
-  throw new Error("IA11_API_KEY missing (required in Render env)");
+function nowMs() {
+  return Date.now();
 }
-
-// Rate limits
-const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 60);
-const RATE_LIMIT_PER_MIN_PRO = Number(process.env.RATE_LIMIT_PER_MIN_PRO || 30);
-
-// Search providers
-const BING_API_KEY = String(process.env.BING_API_KEY || "").trim();
-const BING_ENDPOINT =
-  String(process.env.BING_ENDPOINT || "https://api.bing.microsoft.com/v7.0/search").trim();
-
-const SERPER_API_KEY = String(process.env.SERPER_API_KEY || "").trim();
-const SERPER_ENDPOINT =
-  String(process.env.SERPER_ENDPOINT || "https://google.serper.dev/search").trim();
-
-const SEARCH_PROVIDER = (
-  String(process.env.SEARCH_PROVIDER || "").trim() ||
-  (SERPER_API_KEY ? "serper" : BING_API_KEY ? "bing" : "none")
-).toLowerCase();
-
-if (SEARCH_PROVIDER === "none") {
-  console.warn("⚠️ No search provider configured → Web corroboration disabled.");
-  console.log("🔎 IA11 Search Provider:", SEARCH_PROVIDER);
-  console.log("🔎 SERPER KEY LOADED:", !!SERPER_API_KEY);
-
-}
-
-if (SEARCH_PROVIDER === "serper" && !SERPER_API_KEY) {
-  throw new Error("SEARCH_PROVIDER=serper but SERPER_API_KEY missing");
-}
-
-if (SEARCH_PROVIDER === "bing" && !BING_API_KEY) {
-  throw new Error("SEARCH_PROVIDER=bing but BING_API_KEY missing");
-}
-
-
-
-/* ================= RATE LIMIT ================= */
-
-const rateMap = new Map();
-
-function rateLimit(key, limit) {
-  const now = Date.now();
-  const windowMs = 60_000;
-
-  const entry = rateMap.get(key) || { count: 0, start: now };
-  if (now - entry.start > windowMs) {
-    entry.count = 0;
-    entry.start = now;
-  }
-  entry.count += 1;
-  rateMap.set(key, entry);
-
-  return entry.count <= limit;
-}
-
-/* ================= UTIL ================= */
-
 function uid() {
-  return crypto.randomUUID();
+  return crypto.randomBytes(12).toString("hex");
 }
 
-function normalizeLang(lang) {
-  return typeof lang === "string" && lang.length <= 5 ? lang : "en";
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-/* ================= SEARCH ================= */
-
-async function webSearch(query) {
-    console.log("[IA11] webSearch() provider =", SEARCH_PROVIDER);
-    console.log("[IA11] SERPER_API_KEY present =", !!SERPER_API_KEY);
-    console.log("[IA11] BING_API_KEY present =", !!BING_API_KEY);
-
-  if (SEARCH_PROVIDER === "bing" && BING_API_KEY) {
-    const res = await fetchPro(
-      `${BING_ENDPOINT}?q=${encodeURIComponent(query)}&recency=365`,
-      {
-        headers: { "Ocp-Apim-Subscription-Key": BING_API_KEY },
-      }
-    );
-    const json = await res.json();
-    return (
-      json.webPages?.value?.map((r) => ({
-        title: r.name,
-        url: r.url,
-        snippet: r.snippet || "",
-      })) || []
-    );
-  }
-
-  if (SEARCH_PROVIDER === "serper" && SERPER_API_KEY) {
-    const res = await fetchPro(SERPER_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "X-API-KEY": SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ q: query, num: 10 }),
+function requireKey(req, res, next) {
+  const key = req.header("x-ia11-key");
+  if (!API_KEY || key !== API_KEY) {
+    return res.status(401).json({
+      status: "error",
+      error: { message: "Unauthorized (bad x-ia11-key)" },
     });
-    const json = await res.json();
-    return (
-      json.organic?.map((r) => ({
-        title: r.title,
-        url: r.link,
-        snippet: r.snippet || "",
-      })) || []
-    );
   }
-
-  return [];
+  next();
 }
 
-/* ================= ANALYSIS CORE ================= */
+// Very simple in-memory rate limiter (good enough for now)
+const buckets = new Map(); // key: ip|mode -> {count, resetAt}
+function rateLimit(req, res, next) {
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").toString();
+  const mode = (req.body?.mode === "pro") ? "pro" : "standard";
+  const limit = mode === "pro" ? RATE_LIMIT_PER_MIN_PRO : RATE_LIMIT_PER_MIN;
 
-function classifySource(text, snippet) {
-  const t = `${text} ${snippet}`.toLowerCase();
-  if (t.includes("false") || t.includes("debunk")) return "contradicts";
-  if (t.includes("confirmed") || t.includes("according to")) return "corroborates";
-  return "context";
+  const k = `${ip}|${mode}`;
+  const t = nowMs();
+  let b = buckets.get(k);
+
+  if (!b || t > b.resetAt) {
+    b = { count: 0, resetAt: t + 60_000 };
+    buckets.set(k, b);
+  }
+
+  b.count += 1;
+
+  if (b.count > limit) {
+    const retry = Math.max(1, Math.ceil((b.resetAt - t) / 1000));
+    res.setHeader("Retry-After", String(retry));
+    return res.status(429).json({
+      status: "error",
+      error: { message: `Rate limit exceeded (${limit}/min). Retry in ${retry}s.` },
+    });
+  }
+
+  next();
 }
-
-function buildAnalysis(text, sources, lang) {
-  let score = 50;
-  const signals = [];
-
-  if (text.length > 120) {
-    score += 10;
-    signals.push("Detailed claim");
-  }
-  if (sources.length >= 5) {
-    score += 15;
-    signals.push("Multiple independent sources");
-  }
-
-  const contradict = sources.filter((s) => s.stance === "contradicts").length;
-  const corroborate = sources.filter((s) => s.stance === "corroborates").length;
-
-  if (contradict > corroborate) {
-    score -= 20;
-    signals.push("Contradicting evidence detected");
-  }
-
-  score = clamp(score, 5, 98);
-
-  const riskLevel =
-    score < 40 ? "high" : score < 70 ? "medium" : "low";
-
-  return {
-    score,
-    riskLevel,
-    summary:
-      lang === "fr"
-        ? "Analyse PRO basée sur vérification factuelle et sources réelles."
-        : "PRO analysis based on factual verification and real sources.",
-    explanation:
-      lang === "fr"
-        ? "Cette analyse combine vérification web, cohérence interne et qualité des sources pour évaluer la crédibilité."
-        : "This analysis combines web verification, internal consistency and source quality to assess credibility.",
-    keySignals: signals,
-    verdict:
-      lang === "fr"
-        ? riskLevel === "low"
-          ? "Contenu globalement crédible."
-          : "Contenu à vérifier avec prudence."
-        : riskLevel === "low"
-        ? "Content is largely credible."
-        : "Content should be treated with caution.",
-    confidence: clamp(score / 100, 0.4, 0.95),
-  };
-}
-
-/* ================= ROUTES ================= */
 
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    engine: ENGINE_NAME,
+    engine: ENGINE,
     version: VERSION,
+    message: "IA11 is up",
   });
 });
 
-app.post("/v1/analyze", async (req, res) => {
-  // --- IA11 SCORE BASE (1–99) ---
-let score = 50; // neutral base
+app.get("/v1/analyze", (req, res) => {
+  res.json({
+    status: "ok",
+    engine: ENGINE,
+    version: VERSION,
+    info: "POST /v1/analyze with {text, mode} and header x-ia11-key",
+  });
+});
 
-// Helper clamp
-const clamp = (num, min, max) => Math.min(Math.max(num, min), max);
-
-  const key = req.headers["x-ia11-key"];
-  if (key !== IA11_API_KEY) {
-    return res.status(401).json({ status: "error", message: "Unauthorized" });
+async function serperSearch(query) {
+  if (!SERPER_API_KEY) {
+    return { ok: false, items: [], error: "Missing SERPER_API_KEY" };
   }
 
-  if (!rateLimit(key, RATE_LIMIT_PER_MIN_PRO)) {
-    return res.status(429).json({ status: "error", message: "Rate limit exceeded" });
+  const r = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-KEY": SERPER_API_KEY,
+    },
+    body: JSON.stringify({
+      q: query,
+      num: 8,
+      gl: "ca",
+      hl: "fr",
+    }),
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    return { ok: false, items: [], error: `Serper error ${r.status}: ${txt.slice(0, 200)}` };
   }
 
-  const { text, uiLanguage = "en", mode = "pro" } = req.body;
-  if (!text || typeof text !== "string") {
-    return res.status(400).json({ status: "error", message: "Text missing" });
-  }
+  const json = await r.json();
+  const organic = Array.isArray(json?.organic) ? json.organic : [];
 
-  const lang = normalizeLang(uiLanguage);
-  const requestId = uid();
-  const started = Date.now();
-
-  console.log("🧠 Starting web search for:", text);
-  const rawSources = await webSearch(text);
-  console.log("🧠 Web search returned", rawSources.length, "sources");
-
-  const sources = rawSources.map((s) => ({
-    title: s.title,
-    url: s.url,
-    stance: classifySource(text, s.snippet),
-    confidence: 0.7,
+  const items = organic.slice(0, 8).map((it) => ({
+    title: it?.title || "",
+    url: it?.link || "",
+    snippet: it?.snippet || "",
   }));
 
-  if (sources.length < 5) {
-    return res.status(503).json({
-      status: "retry",
-      message: "Insufficient sources for PRO analysis",
+  return { ok: true, items, error: null };
+}
+
+function buildHeuristicScore(text, sourcesCount) {
+  // Baseline simple mais pas débile:
+  // - texte trop court => score bas
+  // - un peu de sources => monte la confiance
+  const len = text.trim().length;
+
+  let score = 50;
+  let confidence = 0.55;
+
+  if (len < 40) score -= 20;
+  else if (len < 90) score -= 8;
+  else score += 6;
+
+  if (sourcesCount >= 6) { score += 12; confidence += 0.25; }
+  else if (sourcesCount >= 3) { score += 6; confidence += 0.15; }
+  else if (sourcesCount >= 1) { score += 2; confidence += 0.05; }
+  else { score -= 10; confidence -= 0.15; }
+
+  score = Math.max(5, Math.min(98, score));
+  confidence = Math.max(0.1, Math.min(0.98, confidence));
+
+  let riskLevel = "medium";
+  if (score >= 80) riskLevel = "low";
+  if (score <= 45) riskLevel = "high";
+
+  return { score, confidence, riskLevel };
+}
+
+function makeSummary(text, sources, mode) {
+  // Résumé simple: on ne "déclare" pas une vérité absolue.
+  // On parle en termes de "signaux" + "à confirmer".
+  const base =
+    mode === "pro"
+      ? "Analyse PRO : signaux croisés + recherche web."
+      : "Analyse Standard : signaux de base + vérification rapide.";
+
+  const sCount = sources.length;
+
+  return `${base} ${sCount > 0 ? `Trouvé ${sCount} source(s) pertinentes.` : "Aucune source solide trouvée."} ` +
+    `Conclusion: à valider avec des sources fiables et le contexte complet.`;
+}
+
+function makeReasons(text, sources, mode) {
+  const reasons = [];
+
+  const len = text.trim().length;
+  if (len < 40) reasons.push("Le texte est très court : risque de contexte manquant.");
+  else reasons.push("Le texte contient assez de matière pour analyse (contexte minimal).");
+
+  if (sources.length === 0) {
+    reasons.push("Aucune source web claire trouvée via Serper (requête trop vague ou info peu documentée).");
+  } else {
+    reasons.push("Présence de sources web : on peut croiser et comparer.");
+    reasons.push("Vérifie la date des sources : les faits évoluent (politique, économie, etc.).");
+  }
+
+  if (mode === "pro") {
+    reasons.push("Mode PRO : recherche plus structurée + sortie plus détaillée.");
+  } else {
+    reasons.push("Mode Standard : sortie plus courte et prudente.");
+  }
+
+  return reasons.slice(0, 6);
+}
+
+app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
+  const t0 = nowMs();
+  const requestId = uid();
+
+  const text = (req.body?.text || "").toString();
+  const mode = (req.body?.mode === "pro") ? "pro" : "standard";
+
+  if (!text.trim()) {
+    return res.status(400).json({
+      status: "error",
+      requestId,
+      error: { message: "Missing 'text' in body" },
     });
   }
 
-  const analysis = buildAnalysis(text, sources, lang);
+  // Build a search query: keep it simple and robust
+  const q = text.trim().slice(0, 240);
 
-  res.json({
-    status: "success",
+  let sources = [];
+  let searchOk = false;
+  let searchError = null;
+
+  try {
+    const out = await serperSearch(q);
+    searchOk = out.ok;
+    sources = out.items || [];
+    searchError = out.error || null;
+  } catch (e) {
+    searchOk = false;
+    searchError = e?.message || "Unknown search error";
+  }
+
+  // Score (heuristic today, can be upgraded later)
+  const { score, confidence, riskLevel } = buildHeuristicScore(text, sources.length);
+  const summary = makeSummary(text, sources, mode);
+  const reasons = makeReasons(text, sources, mode);
+
+  const tookMs = nowMs() - t0;
+
+  // If Serper is missing, we still return a valid result but warn via reasons
+  if (!searchOk) {
+    reasons.unshift(`Recherche web indisponible: ${searchError || "unknown"}`);
+  }
+
+  return res.json({
+    status: "ok",
     requestId,
-    engine: ENGINE_NAME,
+    engine: ENGINE,
     mode,
     result: {
-      ...analysis,
+      score,
+      riskLevel,
+      summary,
+      reasons,
+      confidence,
       sources,
     },
-    meta: {
-      tookMs: Date.now() - started,
-      version: VERSION,
-    },
+    meta: { tookMs, version: VERSION },
   });
 });
 
-/* ================= START ================= */
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`✅ IA11 Ultra PRO running on port ${PORT}`)
-);
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`[IA11] listening on :${port}`);
+});

@@ -24,14 +24,24 @@ function uid() {
 
 function requireKey(req, res, next) {
   const key = req.header("x-ia11-key");
+
+  // Allow calls from your Lovable frontend without key
+  const origin = req.headers.origin || "";
+  if (origin.includes("lovable") || origin.includes("leenscore")) {
+    return next();
+  }
+
+  // Otherwise require API key (for private/pro use later)
   if (!API_KEY || key !== API_KEY) {
     return res.status(401).json({
       status: "error",
-      error: { message: "Unauthorized (bad x-ia11-key)" },
+      error: { message: "Unauthorized" },
     });
   }
+
   next();
 }
+
 
 // Very simple in-memory rate limiter (good enough for now)
 const buckets = new Map(); // key: ip|mode -> {count, resetAt}

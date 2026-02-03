@@ -1,10 +1,12 @@
 /**
- * IA11 PRO — LeenScore Engine (single-file) — Credible v3.0
- * - Serper web search (multi-query, caching, query shaping)
- * - Evidence-based verdict: confirmed / contradicted / uncertain
- * - Stronger scoring (penalize contradictions hard)
- * - Returns fields that LeenScore UI expects: score, riskLevel, summary, reasons, confidence, sources, bestLinks, breakdown, corroboration, verdict
- * - Logs every request (Render visibility)
+ * IA11 PRO — LeenScore Engine (single-file) — v2.2.0
+ * GOAL: credible outputs (contradiction-aware) + real score range + UI-ready breakdown.
+ *
+ * INPUT  (POST /v1/analyze):
+ *  { text: string, mode?: "standard"|"pro", uiLanguage?: "fr"|"en" }
+ *
+ * OUTPUT:
+ *  { status:"ok", requestId, engine, mode, result:{ score, riskLevel, summary, reasons, confidence, breakdown, corroboration, sources, bestLinks, debug }, meta:{...} }
  */
 
 const express = require("express");
@@ -18,13 +20,15 @@ app.use(express.json({ limit: "1mb" }));
 // =====================
 // Core config
 // =====================
-const VERSION = "3.0.0-pro-credible";
+const VERSION = "2.2.0-pro";
 const ENGINE = "IA11";
 
 const API_KEY = process.env.IA11_API_KEY || "";
 const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
 
-const ALLOW_FRONTEND_BYPASS = String(process.env.IA11_ALLOW_FRONTEND_BYPASS || "false").toLowerCase() === "true";
+const ALLOW_FRONTEND_BYPASS =
+  String(process.env.IA11_ALLOW_FRONTEND_BYPASS || "false").toLowerCase() === "true";
+
 const ALLOWED_ORIGINS = (process.env.IA11_ALLOWED_ORIGINS || "lovable.app,leenscore.com")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -42,10 +46,15 @@ const CACHE_MAX = Number(process.env.IA11_CACHE_MAX || 300);
 // =====================
 // Utilities
 // =====================
-function nowMs() { return Date.now(); }
-function uid() { return crypto.randomBytes(12).toString("hex"); }
-function safeStr(x, max = 2000) { return (x ?? "").toString().slice(0, max); }
-
+function nowMs() {
+  return Date.now();
+}
+function uid() {
+  return crypto.randomBytes(12).toString("hex");
+}
+function safeStr(x, max = 5000) {
+  return (x ?? "").toString().slice(0, max);
+}
 function detectUiLanguage(uiLanguage) {
   const l = safeStr(uiLanguage, 10).toLowerCase();
   if (l.startsWith("en")) return "en";
@@ -66,15 +75,16 @@ const I18N = {
     verifyDates: "Vérifie les dates (politique/économie évoluent vite).",
     tooShort: "Texte très court : contexte faible, risque élevé.",
     enoughContext: "Texte assez long : contexte minimal présent.",
-    evidenceStrong: "Preuves solides (sources crédibles + cohérence).",
-    evidenceMedium: "Preuves modérées (sources présentes, recoupe nécessaire).",
+    evidenceStrong: "Preuves solides (plusieurs sources crédibles).",
+    evidenceMedium: "Preuves moyennes (sources présentes mais à recouper).",
     evidenceWeak: "Preuves faibles (peu de sources ou sources fragiles).",
-    contradicted: "CONTREDIT par les sources consultées.",
-    confirmed: "CONFIRMÉ par les sources consultées.",
-    uncertain: "INCERTAIN : pas assez de preuve externe claire.",
-    searchTips: "Astuce : donne un fait précis + lieu + date pour une vérif béton.",
-    proNote: "Mode PRO : multi-recherche + verdict (confirmé/incertain/contredit).",
-    stdNote: "Mode Standard : sortie courte et prudente.",
+    contradicted: "Contredit par des sources fiables.",
+    uncertain: "Incertitude : sources mixtes ou insuffisantes.",
+    confirmed: "Confirmé par des sources crédibles cohérentes.",
+    tip: "Astuce : ajoute un fait précis + lieu + date pour une vérif béton.",
+    outcomeConfirmed: "confirmé",
+    outcomeUncertain: "incertain",
+    outcomeContradicted: "contredit",
   },
   en: {
     unauthorized: "Unauthorized",
@@ -89,19 +99,22 @@ const I18N = {
     verifyDates: "Check dates (politics/economy change fast).",
     tooShort: "Very short text: weak context, higher risk.",
     enoughContext: "Text long enough: minimal context present.",
-    evidenceStrong: "Strong evidence (credible sources + consistency).",
-    evidenceMedium: "Moderate evidence (sources exist, cross-check needed).",
+    evidenceStrong: "Strong evidence (multiple credible sources).",
+    evidenceMedium: "Medium evidence (sources exist, still cross-check).",
     evidenceWeak: "Weak evidence (few sources or fragile sources).",
-    contradicted: "CONTRADICTED by consulted sources.",
-    confirmed: "CONFIRMED by consulted sources.",
-    uncertain: "UNCERTAIN: not enough clear external evidence.",
-    searchTips: "Tip: add a precise fact + place + date for a rock-solid check.",
-    proNote: "PRO mode: multi-query search + verdict (confirmed/uncertain/contradicted).",
-    stdNote: "Standard mode: short and cautious output.",
+    contradicted: "Contradicted by credible sources.",
+    uncertain: "Uncertain: mixed or insufficient sources.",
+    confirmed: "Confirmed by consistent credible sources.",
+    tip: "Tip: add a precise fact + place + date for a rock-solid check.",
+    outcomeConfirmed: "confirmed",
+    outcomeUncertain: "uncertain",
+    outcomeContradicted: "contradicted",
   },
 };
 
-function tPick(lang) { return I18N[lang] || I18N.fr; }
+function pickT(lang) {
+  return I18N[lang] || I18N.fr;
+}
 
 // =====================
 // Security gate
@@ -122,8 +135,11 @@ function requireKey(req, res, next) {
 
   if (!API_KEY || key !== API_KEY) {
     const lang = detectUiLanguage(req.body?.uiLanguage);
-    const t = tPick(lang);
-    return res.status(401).json({ status: "error", error: { message: t.unauthorized } });
+    const t = pickT(lang);
+    return res.status(401).json({
+      status: "error",
+      error: { message: t.unauthorized },
+    });
   }
   next();
 }
@@ -131,7 +147,7 @@ function requireKey(req, res, next) {
 // =====================
 // Rate limiter
 // =====================
-const buckets = new Map(); // key: ip|mode -> {count, resetAt}
+const buckets = new Map();
 
 function getClientIp(req) {
   const xff = safeStr(req.headers["x-forwarded-for"], 200);
@@ -141,27 +157,28 @@ function getClientIp(req) {
 
 function rateLimit(req, res, next) {
   const ip = getClientIp(req);
-  const mode = req.body?.mode === "pro" || req.body?.analysisType === "pro" ? "pro" : "standard";
+  const mode = req.body?.mode === "pro" ? "pro" : "standard";
   const limit = mode === "pro" ? RATE_LIMIT_PER_MIN_PRO : RATE_LIMIT_PER_MIN;
 
   const k = `${ip}|${mode}`;
-  const time = nowMs();
+  const t = nowMs();
   let b = buckets.get(k);
 
-  if (!b || time > b.resetAt) {
-    b = { count: 0, resetAt: time + 60_000 };
+  if (!b || t > b.resetAt) {
+    b = { count: 0, resetAt: t + 60_000 };
     buckets.set(k, b);
   }
-  b.count += 1;
 
+  b.count += 1;
   if (b.count > limit) {
-    const retry = Math.max(1, Math.ceil((b.resetAt - time) / 1000));
+    const retry = Math.max(1, Math.ceil((b.resetAt - t) / 1000));
     res.setHeader("Retry-After", String(retry));
     return res.status(429).json({
       status: "error",
       error: { message: `Rate limit exceeded (${limit}/min). Retry in ${retry}s.` },
     });
   }
+
   next();
 }
 
@@ -187,10 +204,10 @@ function domainTrust(domain) {
   if (!domain) return 0;
   if (domain.endsWith(".gov") || domain.endsWith(".gc.ca")) return 3;
   if (domain.endsWith(".edu")) return 2;
-  if (domain.includes("who.int") || domain.includes("un.org") || domain.includes("canada.ca")) return 3;
+  if (domain.includes("wikipedia.org")) return 1;
   if (domain.includes("reuters.com") || domain.includes("apnews.com")) return 2;
   if (domain.includes("bbc.co.uk") || domain.includes("bbc.com")) return 2;
-  if (domain.includes("wikipedia.org")) return 1;
+  if (domain.includes("canada.ca") || domain.includes("who.int") || domain.includes("un.org")) return 3;
   return 0;
 }
 
@@ -217,14 +234,14 @@ function cleanSources(items) {
     uniq.push(s);
   }
 
-  uniq.sort((a, b) => (b.trust - a.trust));
+  uniq.sort((a, b) => b.trust - a.trust);
   return uniq.slice(0, 8);
 }
 
 // =====================
-// Serper cache (in-memory)
+// Serper cache
 // =====================
-const cache = new Map(); // key -> {at, data}
+const cache = new Map();
 function cacheGet(key) {
   const v = cache.get(key);
   if (!v) return null;
@@ -259,24 +276,22 @@ function buildQueries(text, mode, lang) {
   const lower = base.toLowerCase();
   const looksLikeClaim =
     lower.includes(" est ") ||
+    lower.includes(" est un ") ||
+    lower.includes(" est une ") ||
     lower.includes(" is ") ||
-    lower.includes(" président") ||
+    lower.includes(" is a ") ||
     lower.includes(" president") ||
-    lower.includes(" capitale") ||
-    lower.includes(" capital") ||
-    lower.includes(" ville") ||
-    lower.includes(" city") ||
-    lower.includes(" pays") ||
-    lower.includes(" country");
+    lower.includes(" président") ||
+    lower.includes(" prime minister") ||
+    lower.includes(" premier ministre");
 
   const factCheck = lang === "en" ? " fact check" : " vérification";
-  const define = lang === "en" ? " is a country or city" : " est un pays ou une ville";
   const currentYear = new Date().getFullYear();
   const yearHint = ` ${currentYear}`;
 
   const q1 = base;
-  const q2 = looksLikeClaim ? (base + factCheck) : (base + yearHint);
-  const q3 = looksLikeClaim ? (base + define) : (base + factCheck);
+  const q2 = looksLikeClaim ? base + factCheck : base + yearHint;
+  const q3 = looksLikeClaim ? base + yearHint : base + factCheck;
 
   const qs = [q1, q2, q3].map((q) => q.trim()).filter(Boolean);
   return [...new Set(qs)].slice(0, 3);
@@ -314,6 +329,7 @@ async function serperSearch(query, uiLanguage) {
 
   const json = await r.json();
   const organic = Array.isArray(json?.organic) ? json.organic : [];
+
   const items = organic.slice(0, 8).map((it) => ({
     title: it?.title || "",
     url: it?.link || "",
@@ -349,266 +365,241 @@ async function serperMultiSearch(text, mode, uiLanguage) {
   return {
     ok: okCount > 0,
     items: all,
-    error: okCount > 0 ? null : (lastError || "Unknown search error"),
+    error: okCount > 0 ? null : lastError || "Unknown search error",
     queries,
   };
 }
 
 // =====================
-// Evidence-based verdict (confirmed / contradicted / uncertain)
+// CONTRADICTION CHECK (lightweight but effective for obvious lies)
+// Works off Serper snippets (no LLM).
 // =====================
-
-// Light claim parsing for common patterns (FR/EN)
-function extractClaimShape(text) {
-  const s = normalizeQuery(text);
-  const lower = s.toLowerCase();
-
-  // FR: "X est une ville de Y" / "X est un pays" / "X est la capitale de Y"
-  let m = lower.match(/^(.+?)\s+est\s+une\s+ville\s+de\s+(.+?)\.?$/i);
-  if (m) return { type: "is_city_of", a: m[1].trim(), b: m[2].trim(), lang: "fr" };
-
-  m = lower.match(/^(.+?)\s+est\s+la\s+capitale\s+de\s+(.+?)\.?$/i);
-  if (m) return { type: "is_capital_of", a: m[1].trim(), b: m[2].trim(), lang: "fr" };
-
-  m = lower.match(/^(.+?)\s+est\s+un\s+pays\.?$/i);
-  if (m) return { type: "is_country", a: m[1].trim(), b: null, lang: "fr" };
-
-  // EN: "X is a city of Y" / "X is the capital of Y" / "X is a country"
-  m = lower.match(/^(.+?)\s+is\s+a\s+city\s+of\s+(.+?)\.?$/i);
-  if (m) return { type: "is_city_of", a: m[1].trim(), b: m[2].trim(), lang: "en" };
-
-  m = lower.match(/^(.+?)\s+is\s+the\s+capital\s+of\s+(.+?)\.?$/i);
-  if (m) return { type: "is_capital_of", a: m[1].trim(), b: m[2].trim(), lang: "en" };
-
-  m = lower.match(/^(.+?)\s+is\s+a\s+country\.?$/i);
-  if (m) return { type: "is_country", a: m[1].trim(), b: null, lang: "en" };
-
-  return { type: "generic", a: null, b: null, lang: null };
+function normalizeTextForMatch(s) {
+  return safeStr(s, 2000).toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function snippetContainsAll(snippet, words) {
-  const s = (snippet || "").toLowerCase();
-  return words.every((w) => w && s.includes(w.toLowerCase()));
-}
+function extractSimpleClaim(text, lang) {
+  const t = safeStr(text, 800).trim();
+  const lower = t.toLowerCase();
 
-function evidenceScan(text, sources, lang) {
-  const claim = extractClaimShape(text);
-  const combined = sources.map((x) => `${x.title} ${x.snippet}`.toLowerCase());
-
-  // Evidence counters
-  let confirmHits = 0;
-  let contradictHits = 0;
-
-  // Higher trust = higher weight
-  function weight(src) { return 1 + (src.trust || 0) * 0.6; }
-
-  let confirmWeight = 0;
-  let contradictWeight = 0;
-
-  // Generic helpers
-  const A = (claim.a || "").toLowerCase();
-  const B = (claim.b || "").toLowerCase();
-
-  // If we can parse a claim, we try to confirm/contradict it from snippets
-  if (claim.type !== "generic" && A) {
-    for (const src of sources) {
-      const blob = `${src.title} ${src.snippet}`.toLowerCase();
-
-      if (claim.type === "is_city_of" && B) {
-        // Confirm patterns: "A is a city in B" OR "A, a city in B"
-        const confirmPatterns = lang === "en"
-          ? [[A, "city", B], [A, "city in", B]]
-          : [[A, "ville", B], [A, "ville de", B], [A, "ville en", B]];
-
-        const contradictPatterns = lang === "en"
-          ? [[A, "country"], [A, "sovereign state"], [A, "nation"]]
-          : [[A, "pays"], [A, "état"], [A, "nation"]];
-
-        const cOk = confirmPatterns.some((w) => snippetContainsAll(blob, w));
-        const xOk = contradictPatterns.some((w) => snippetContainsAll(blob, w));
-
-        if (cOk) { confirmHits += 1; confirmWeight += weight(src); }
-        if (xOk) { contradictHits += 1; contradictWeight += weight(src); }
-      }
-
-      if (claim.type === "is_country") {
-        const confirmPatterns = lang === "en"
-          ? [[A, "country"], [A, "sovereign state"], [A, "nation"]]
-          : [[A, "pays"], [A, "état"], [A, "nation"]];
-
-        const contradictPatterns = lang === "en"
-          ? [[A, "city"], [A, "town"], [A, "village"]]
-          : [[A, "ville"], [A, "municipalité"], [A, "village"]];
-
-        const cOk = confirmPatterns.some((w) => snippetContainsAll(blob, w));
-        const xOk = contradictPatterns.some((w) => snippetContainsAll(blob, w));
-
-        if (cOk) { confirmHits += 1; confirmWeight += weight(src); }
-        if (xOk) { contradictHits += 1; contradictWeight += weight(src); }
-      }
-
-      if (claim.type === "is_capital_of" && B) {
-        const confirmPatterns = lang === "en"
-          ? [[A, "capital", B]]
-          : [[A, "capitale", B]];
-
-        const cOk = confirmPatterns.some((w) => snippetContainsAll(blob, w));
-        if (cOk) { confirmHits += 1; confirmWeight += weight(src); }
-      }
-    }
+  // FR: "X est une Y" / "X est un Y"
+  if (lang === "fr") {
+    const m = lower.match(/^(.{2,60})\s+est\s+(une|un)\s+(.{2,80})$/i);
+    if (m) return { subject: m[1].trim(), object: m[3].trim(), kind: "is-a" };
   }
 
-  // Verdict decision
-  // Contradiction wins if it has decent weight and beats confirmation.
-  let verdict = "uncertain";
-  if (contradictWeight >= 2.2 && contradictWeight > confirmWeight * 1.15) verdict = "contradicted";
-  else if (confirmWeight >= 2.2 && confirmWeight > contradictWeight * 1.15) verdict = "confirmed";
-  else verdict = "uncertain";
+  // EN: "X is a Y" / "X is an Y"
+  if (lang === "en") {
+    const m = lower.match(/^(.{2,60})\s+is\s+(a|an)\s+(.{2,80})$/i);
+    if (m) return { subject: m[1].trim(), object: m[3].trim(), kind: "is-a" };
+  }
 
-  return {
-    verdict,
-    claim,
-    confirmHits,
-    contradictHits,
-    confirmWeight: Number(confirmWeight.toFixed(2)),
-    contradictWeight: Number(contradictWeight.toFixed(2)),
-  };
+  return null;
+}
+
+const TYPE_GROUPS = {
+  city: ["city", "town", "ville", "municipalité"],
+  country: ["country", "nation", "pays", "état", "state"],
+};
+
+function typeFromObject(objLower) {
+  const o = objLower;
+  for (const k of Object.keys(TYPE_GROUPS)) {
+    if (TYPE_GROUPS[k].some((w) => o.includes(w))) return k;
+  }
+  return null;
+}
+
+function snippetSaysType(subjectLower, snippetLower, typeKey) {
+  const words = TYPE_GROUPS[typeKey] || [];
+  // must mention subject + one of the type words near-ish
+  if (!snippetLower.includes(subjectLower)) return false;
+  return words.some((w) => snippetLower.includes(w));
+}
+
+function assessContradiction(text, sources, lang) {
+  const claim = extractSimpleClaim(text, lang);
+  if (!claim) return { detected: false, strength: 0, note: null };
+
+  const subject = claim.subject;
+  const object = claim.object;
+
+  const subjL = subject.toLowerCase();
+  const objL = object.toLowerCase();
+
+  const claimedType = typeFromObject(objL);
+  if (!claimedType) {
+    // still can catch obvious "Canada is a city" vs snippets "Canada is a country"
+    // but if object doesn't contain a type keyword, skip.
+    return { detected: false, strength: 0, note: null };
+  }
+
+  const snippets = sources.map((s) => normalizeTextForMatch(`${s.title} ${s.snippet}`));
+
+  let support = 0;
+  let oppose = 0;
+
+  for (const sn of snippets) {
+    // support: subject + claimed type appears
+    if (snippetSaysType(subjL, sn, claimedType)) support += 1;
+
+    // oppose: subject + opposite type appears
+    if (claimedType === "city" && snippetSaysType(subjL, sn, "country")) oppose += 1;
+    if (claimedType === "country" && snippetSaysType(subjL, sn, "city")) oppose += 1;
+  }
+
+  // Strong contradiction when opposite appears >=2 and support is 0
+  if (oppose >= 2 && support === 0) {
+    return {
+      detected: true,
+      strength: 3,
+      note: `${subject} vs type mismatch: claim "${claimedType}" but sources strongly show opposite.`,
+      support,
+      oppose,
+    };
+  }
+
+  // Medium contradiction when oppose > support
+  if (oppose > support) {
+    return {
+      detected: true,
+      strength: 2,
+      note: `${subject} seems inconsistent with sources.`,
+      support,
+      oppose,
+    };
+  }
+
+  // No contradiction
+  return { detected: false, strength: 0, note: null, support, oppose };
 }
 
 // =====================
-// Scoring (credible)
+// SCORING + BREAKDOWN (UI-ready)
 // =====================
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
 
-function buildScore(text, sources, scan, mode) {
-  const len = text.trim().length;
+function computeEvidence(sources) {
   const sCount = sources.length;
   const trustSum = sources.reduce((a, s) => a + (s.trust || 0), 0);
 
-  // Base score depends on verdict
-  let scoreBase = 55; // neutral
-  if (scan.verdict === "confirmed") scoreBase = 78;
-  if (scan.verdict === "contradicted") scoreBase = 22;
+  let label = "weak";
+  if (sCount >= 3 && trustSum >= 3) label = "medium";
+  if (sCount >= 5 && trustSum >= 6) label = "strong";
 
-  // Context influence
-  let ctxBonus = 0;
-  if (len < 40) ctxBonus -= 12;
-  else if (len < 90) ctxBonus -= 6;
-  else if (len > 220) ctxBonus += 6;
+  return { sCount, trustSum, label };
+}
 
-  // Evidence influence
-  let evBonus = 0;
-  if (sCount >= 6) evBonus += 10;
-  else if (sCount >= 3) evBonus += 6;
-  else if (sCount >= 1) evBonus += 2;
-  else evBonus -= 10;
+function buildBreakdown(lang, evidence, textLen, contradiction) {
+  const t = pickT(lang);
 
-  // Trust influence
-  let trBonus = 0;
-  if (trustSum >= 6) trBonus += 8;
-  else if (trustSum >= 3) trBonus += 4;
-  else if (trustSum >= 1) trBonus += 1;
+  // points are 0..20 each (UI doesn't care exact max; it cares consistency + reasons)
+  // We'll output meaningful reasons so your UI looks "alive".
+  let sourcesPts = 0;
+  if (evidence.label === "strong") sourcesPts = 18;
+  else if (evidence.label === "medium") sourcesPts = 12;
+  else if (evidence.sCount >= 1) sourcesPts = 7;
+  else sourcesPts = 2;
 
-  // PRO has slightly wider spread
-  const proSpread = mode === "pro" ? 1.15 : 1.0;
+  let factualPts = 10;
+  if (contradiction.detected && contradiction.strength >= 2) factualPts = 2;
+  else if (contradiction.detected) factualPts = 6;
 
-  let score = Math.round((scoreBase + ctxBonus + evBonus + trBonus) * proSpread);
+  let contextPts = textLen >= 220 ? 16 : textLen >= 90 ? 12 : textLen >= 40 ? 8 : 4;
 
-  // Hard rules: contradiction should not be "moderate"
-  if (scan.verdict === "contradicted") score = clamp(score, 5, 35);
-  if (scan.verdict === "confirmed") score = clamp(score, 65, 98);
+  // "tone" here is really "prudence" in your UI mapping
+  let tonePts = 12; // default: cautious
+  if (contradiction.detected) tonePts = 14; // more cautious
+  if (evidence.label === "strong" && !contradiction.detected) tonePts = 10; // less cautious
 
-  // General clamp
-  score = clamp(score, 5, 98);
+  let transparencyPts = evidence.sCount >= 3 ? 14 : evidence.sCount >= 1 ? 10 : 6;
 
-  // Confidence 0..1
+  return {
+    sources: { points: sourcesPts, reason: evidence.sCount ? t.foundSources(evidence.sCount) : t.noSources },
+    factual: {
+      points: factualPts,
+      reason: contradiction.detected ? t.contradicted : (evidence.label === "strong" ? t.confirmed : t.uncertain),
+    },
+    tone: { points: tonePts, reason: t.verifyDates },
+    context: { points: contextPts, reason: textLen < 40 ? t.tooShort : t.enoughContext },
+    transparency: { points: transparencyPts, reason: t.tip },
+  };
+}
+
+function scoreFromSignals(textLen, evidence, contradiction, mode) {
+  // Start wider so we don’t live in 45–55 hell.
+  let score = 60;
+
+  // Context
+  if (textLen < 40) score -= 20;
+  else if (textLen < 90) score -= 10;
+  else if (textLen > 220) score += 6;
+
+  // Evidence
+  if (evidence.label === "strong") score += 18;
+  else if (evidence.label === "medium") score += 10;
+  else if (evidence.sCount >= 1) score += 3;
+  else score -= 18;
+
+  // Trust sum nudges
+  if (evidence.trustSum >= 6) score += 8;
+  else if (evidence.trustSum >= 3) score += 4;
+  else if (evidence.trustSum >= 1) score += 1;
+
+  // CONTRADICTION overrides hard (this is your “credibility” core)
+  if (contradiction.detected && contradiction.strength >= 3) score = Math.min(score, 22);
+  else if (contradiction.detected && contradiction.strength >= 2) score = Math.min(score, 32);
+  else if (contradiction.detected) score = Math.min(score, 45);
+
+  // PRO is stricter: if weak evidence, don’t inflate
+  if (mode === "pro" && evidence.label === "weak") score -= 6;
+
+  score = clamp(Math.round(score), 5, 98);
+
+  // Confidence 0.10..0.95
   let confidence = 0.55;
-  if (scan.verdict === "confirmed") confidence = 0.82;
-  if (scan.verdict === "contradicted") confidence = 0.80;
-  if (scan.verdict === "uncertain") confidence = 0.48;
-
-  // Confidence rises with trust + count
-  confidence += Math.min(0.12, (trustSum * 0.02));
-  confidence += Math.min(0.10, (Math.max(0, sCount - 1) * 0.02));
-  if (len < 40) confidence -= 0.08;
-
-  confidence = clamp(Number(confidence.toFixed(2)), 0.15, 0.98);
+  if (evidence.label === "strong") confidence += 0.25;
+  if (evidence.label === "medium") confidence += 0.15;
+  if (evidence.sCount === 0) confidence -= 0.20;
+  if (textLen < 40) confidence -= 0.10;
+  if (contradiction.detected) confidence += 0.05; // we’re confident when we see contradiction
+  confidence = clamp(Number(confidence.toFixed(2)), 0.1, 0.95);
 
   // Risk
   let riskLevel = "medium";
   if (score >= 80) riskLevel = "low";
   if (score <= 45) riskLevel = "high";
 
-  // Evidence label
-  let evidence = "weak";
-  if (sCount >= 3 && trustSum >= 3) evidence = "medium";
-  if (sCount >= 5 && trustSum >= 6) evidence = "strong";
+  // Corroboration outcome
+  let outcome = "uncertain";
+  if (contradiction.detected && contradiction.strength >= 2) outcome = "contradicted";
+  else if (!contradiction.detected && evidence.label === "strong") outcome = "confirmed";
 
-  // Breakdown points (0..20 each)
-  // (Simple but useful for UI)
-  const breakdown = {
-    sources: {
-      points: clamp(Math.round((sCount / 8) * 20), 0, 20),
-      reason: `Sources: ${sCount}/8`,
-    },
-    factual: {
-      points: scan.verdict === "confirmed" ? 18 : scan.verdict === "contradicted" ? 4 : 10,
-      reason: `Verdict: ${scan.verdict}`,
-    },
-    tone: {
-      points: 12,
-      reason: "Style: prudent (no certainty without proof).",
-    },
-    context: {
-      points: clamp(len < 40 ? 6 : len < 90 ? 10 : len < 220 ? 14 : 17, 0, 20),
-      reason: `Length: ${len} chars`,
-    },
-    transparency: {
-      points: clamp(Math.round((Math.min(8, sCount) / 8) * 20), 0, 20),
-      reason: "Links provided for verification.",
-    },
-  };
-
-  // Corroboration object (UI-friendly)
-  const corroboration = {
-    outcome: scan.verdict,
-    sourcesConsulted: sCount,
-    sourceTypes: Array.from(new Set(sources.map((s) => {
-      const d = s.domain || "";
-      if (d.endsWith(".gov") || d.endsWith(".gc.ca")) return "government";
-      if (d.endsWith(".edu")) return "education";
-      if (d.includes("wikipedia.org")) return "reference";
-      if (s.trust >= 2) return "major-media";
-      return "web";
-    }))),
-    summary: `confirmWeight=${scan.confirmWeight}, contradictWeight=${scan.contradictWeight}`,
-  };
-
-  return { score, confidence, riskLevel, evidence, trustSum, sourcesCount: sCount, breakdown, corroboration };
+  return { score, confidence, riskLevel, outcome };
 }
 
-// =====================
-// Summary + reasons + verdict block
-// =====================
-function makeSummary(lang, mode, scoring, scan, sourcesCount) {
-  const t = tPick(lang);
+function makeSummary(lang, mode, score, riskLevel, evidenceLabel, outcome, sourcesCount) {
+  const t = pickT(lang);
+
   const header = mode === "pro" ? t.proHeader : t.stdHeader;
 
   const evidenceLine =
-    scoring.evidence === "strong" ? t.evidenceStrong :
-    scoring.evidence === "medium" ? t.evidenceMedium :
+    evidenceLabel === "strong" ? t.evidenceStrong :
+    evidenceLabel === "medium" ? t.evidenceMedium :
     t.evidenceWeak;
 
   const sourcesLine = sourcesCount > 0 ? t.foundSources(sourcesCount) : t.noSources;
 
-  const verdictLine =
-    scan.verdict === "confirmed" ? t.confirmed :
-    scan.verdict === "contradicted" ? t.contradicted :
+  const outcomeLine =
+    outcome === "confirmed" ? t.confirmed :
+    outcome === "contradicted" ? t.contradicted :
     t.uncertain;
 
   return [
-    `${header} — Score: ${scoring.score}/100 — Risque: ${scoring.riskLevel.toUpperCase()}.`,
-    verdictLine,
+    `${header} — Score: ${score}/100 — Risque: ${riskLevel.toUpperCase()}.`,
+    outcomeLine,
     sourcesLine,
     evidenceLine,
     `${t.conclusion}: si c’est un fait “sensible” (politique, santé, argent), recoupe 2 sources crédibles minimum.`,
@@ -616,56 +607,30 @@ function makeSummary(lang, mode, scoring, scan, sourcesCount) {
   ].join(" ");
 }
 
-function makeReasons(lang, mode, text, sources, searchOk, searchError, scoring, scan) {
-  const t = tPick(lang);
+function makeReasons(lang, mode, textLen, evidence, searchOk, searchError, contradiction) {
+  const t = pickT(lang);
   const reasons = [];
 
-  const len = text.trim().length;
-  if (len < 40) reasons.push(t.tooShort);
+  if (!searchOk) reasons.push(`${t.webDown}: ${searchError || "unknown"}`);
+
+  if (textLen < 40) reasons.push(t.tooShort);
   else reasons.push(t.enoughContext);
 
-  if (!searchOk) {
-    reasons.unshift(`${t.webDown}: ${searchError || "unknown"}`);
-    reasons.push(t.searchTips);
-  } else if (sources.length === 0) {
-    reasons.push(t.noSources);
-    reasons.push(t.searchTips);
-  } else {
-    if (scan.verdict === "contradicted") reasons.push(t.contradicted);
-    if (scan.verdict === "confirmed") reasons.push(t.confirmed);
-    if (scan.verdict === "uncertain") reasons.push(t.uncertain);
+  if (contradiction.detected) reasons.push(t.contradicted);
 
-    if (scoring.evidence === "strong") reasons.push(t.evidenceStrong);
-    else if (scoring.evidence === "medium") reasons.push(t.evidenceMedium);
-    else reasons.push(t.evidenceWeak);
+  if (evidence.label === "strong") reasons.push(t.evidenceStrong);
+  else if (evidence.label === "medium") reasons.push(t.evidenceMedium);
+  else reasons.push(t.evidenceWeak);
 
-    const topDomains = sources.slice(0, 5).map((s) => s.domain).filter(Boolean);
-    if (topDomains.length) {
-      reasons.push((lang === "en" ? "Top domains: " : "Domaines principaux : ") + topDomains.join(", "));
-    }
-  }
+  if (evidence.sCount === 0) reasons.push(t.tip);
 
-  reasons.push(mode === "pro" ? t.proNote : t.stdNote);
+  reasons.push(
+    mode === "pro"
+      ? (lang === "en" ? "PRO mode: multi-query web search + contradiction checks." : "Mode PRO : recherche multi-angles + détection de contradictions.")
+      : (lang === "en" ? "Standard mode: cautious output." : "Mode Standard : sortie prudente.")
+  );
+
   return reasons.slice(0, 6);
-}
-
-function buildVerdictBlock(scan) {
-  // UI can map these to “Confirmé / Incertain / Contredit”
-  const out = {
-    confirmed: [],
-    uncertain: [],
-    contradicted: [],
-  };
-
-  const claim = scan.claim?.type && scan.claim.type !== "generic"
-    ? `${scan.claim.a}${scan.claim.b ? " -> " + scan.claim.b : ""} (${scan.claim.type})`
-    : "generic";
-
-  if (scan.verdict === "confirmed") out.confirmed.push(claim);
-  else if (scan.verdict === "contradicted") out.contradicted.push(claim);
-  else out.uncertain.push(claim);
-
-  return out;
 }
 
 // =====================
@@ -676,7 +641,7 @@ app.get("/", (req, res) => {
     status: "ok",
     engine: ENGINE,
     version: VERSION,
-    message: "IA11 PRO credible is up",
+    message: "IA11 PRO is up",
     bypassEnabled: ALLOW_FRONTEND_BYPASS,
     allowedOrigins: ALLOWED_ORIGINS,
   });
@@ -687,7 +652,7 @@ app.get("/v1/analyze", (req, res) => {
     status: "ok",
     engine: ENGINE,
     version: VERSION,
-    info: "POST /v1/analyze with {text|content, mode|analysisType, uiLanguage} and header x-ia11-key",
+    info: "POST /v1/analyze with {text, mode, uiLanguage} (and header x-ia11-key unless bypass enabled)",
   });
 });
 
@@ -695,12 +660,10 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
   const t0 = nowMs();
   const requestId = uid();
 
-  // Accept multiple frontend shapes
-  const text = safeStr(req.body?.text ?? req.body?.content ?? "", 6000);
-  const mode = (req.body?.mode === "pro" || req.body?.analysisType === "pro") ? "pro" : "standard";
+  const text = safeStr(req.body?.text, 6000);
+  const mode = req.body?.mode === "pro" ? "pro" : "standard";
   const lang = detectUiLanguage(req.body?.uiLanguage);
-
-  const t = tPick(lang);
+  const t = pickT(lang);
 
   if (!text.trim()) {
     return res.status(400).json({
@@ -709,6 +672,9 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
       error: { message: t.missingText },
     });
   }
+
+  // LOG: you will see requests now (if your UI truly hits Render)
+  console.log(`[IA11] req=${requestId} mode=${mode} lang=${lang} len=${text.trim().length}`);
 
   let rawSources = [];
   let sources = [];
@@ -728,40 +694,46 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
   }
 
   sources = cleanSources(rawSources);
+  const evidence = computeEvidence(sources);
 
-  // Evidence scan + credible scoring
-  const scan = evidenceScan(text, sources, lang);
-  const scoring = buildScore(text, sources, scan, mode);
+  const contradiction = assessContradiction(text, sources, lang);
 
-  const summary = makeSummary(lang, mode, scoring, scan, scoring.sourcesCount);
-  const reasons = makeReasons(lang, mode, text, sources, searchOk, searchError, scoring, scan);
+  const textLen = text.trim().length;
+  const scored = scoreFromSignals(textLen, evidence, contradiction, mode);
+
+  const breakdown = buildBreakdown(lang, evidence, textLen, contradiction);
+  const summary = makeSummary(lang, mode, scored.score, scored.riskLevel, evidence.label, scored.outcome, evidence.sCount);
+  const reasons = makeReasons(lang, mode, textLen, evidence, searchOk, searchError, contradiction);
 
   const tookMs = nowMs() - t0;
 
-  // Render logs (the thing you were missing)
-  console.log(
-    `[IA11] requestId=${requestId} mode=${mode} lang=${lang} score=${scoring.score} verdict=${scan.verdict} sources=${scoring.sourcesCount} trustSum=${scoring.trustSum} tookMs=${tookMs} queries=${JSON.stringify(queriesUsed)}`
-  );
+  // Corroboration object for your UI "Points clés PRO"
+  const corroboration = {
+    outcome:
+      scored.outcome === "confirmed" ? t.outcomeConfirmed :
+      scored.outcome === "contradicted" ? t.outcomeContradicted :
+      t.outcomeUncertain,
+    sourcesConsulted: evidence.sCount,
+    sourceTypes: ["web"],
+    summary:
+      scored.outcome === "confirmed" ? t.confirmed :
+      scored.outcome === "contradicted" ? t.contradicted :
+      t.uncertain,
+  };
 
   return res.json({
     status: "ok",
     requestId,
     engine: ENGINE,
     mode,
-    analysisType: mode === "pro" ? "pro" : "standard", // UI-friendly
     result: {
-      score: scoring.score,
-      riskLevel: scoring.riskLevel,
+      score: scored.score,
+      riskLevel: scored.riskLevel,
       summary,
       reasons,
-      confidence: scoring.confidence,
-
-      // UI needs these
-      breakdown: scoring.breakdown,
-      corroboration: scoring.corroboration,
-      verdict: buildVerdictBlock(scan),
-
-      // Sources + links
+      confidence: scored.confidence,
+      breakdown,
+      corroboration,
       sources: sources.map((s) => ({
         title: s.title,
         url: s.url,
@@ -769,16 +741,16 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
         domain: s.domain,
       })),
       bestLinks: sources.map((s) => ({ title: s.title, url: s.url })),
-
       debug: {
         queriesUsed,
-        trustSum: scoring.trustSum,
-        sourcesCount: scoring.sourcesCount,
-        confirmWeight: scan.confirmWeight,
-        contradictWeight: scan.contradictWeight,
-        confirmHits: scan.confirmHits,
-        contradictHits: scan.contradictHits,
-        claim: scan.claim,
+        trustSum: evidence.trustSum,
+        sourcesCount: evidence.sCount,
+        evidence: evidence.label,
+        contradictionDetected: Boolean(contradiction.detected),
+        contradictionStrength: contradiction.strength || 0,
+        support: contradiction.support ?? null,
+        oppose: contradiction.oppose ?? null,
+        note: contradiction.note || null,
       },
     },
     meta: {

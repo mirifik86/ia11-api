@@ -1,5 +1,5 @@
 /**
- * IA11 PRO — LeenScore Engine (single-file) — v2.2.0
+ * IA11 PRO — LeenScore Engine (single-file) — v2.2.1
  * GOAL: credible outputs (contradiction-aware) + real score range + UI-ready breakdown.
  *
  * INPUT  (POST /v1/analyze):
@@ -13,22 +13,35 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 
+// ---- fetch safety (Render/Node compatibility) ----
+let _fetch = global.fetch;
+if (!_fetch) {
+  try {
+    _fetch = require("node-fetch");
+  } catch (e) {
+    // If fetch is missing AND node-fetch is not installed, Serper will fail gracefully.
+    _fetch = null;
+  }
+}
+
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 // =====================
 // Core config
 // =====================
-const VERSION = "2.2.0-pro";
+const VERSION = "2.2.1-pro";
 const ENGINE = "IA11";
 
 const API_KEY = process.env.IA11_API_KEY || "";
 const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
 
+// IMPORTANT: you said you want KEY security (world project).
+// Keep bypass OFF by default. If you ever enable it, it is still constrained by allowed origins.
 const ALLOW_FRONTEND_BYPASS =
   String(process.env.IA11_ALLOW_FRONTEND_BYPASS || "false").toLowerCase() === "true";
 
+// Put ONLY domains here (no protocol). Example: lovable.app, leenscore.com
 const ALLOWED_ORIGINS = (process.env.IA11_ALLOWED_ORIGINS || "lovable.app,leenscore.com")
   .split(",")
   .map((s) => s.trim().toLowerCase())
@@ -42,6 +55,38 @@ const SERPER_GL = (process.env.SERPER_GL || "ca").toLowerCase();
 
 const CACHE_TTL_MS = Number(process.env.IA11_CACHE_TTL_MS || 10 * 60 * 1000);
 const CACHE_MAX = Number(process.env.IA11_CACHE_MAX || 300);
+
+// =====================
+// CORS (PRO + stable for browser + Lovable)
+// =====================
+// We allow only configured origins AND allow the custom header x-ia11-key.
+function originAllowed(origin) {
+  if (!origin) return true; // server-to-server or curl
+  try {
+    const u = new URL(origin);
+    const host = (u.hostname || "").toLowerCase();
+    // allow if hostname ends with any allowed domain (lovable.app covers *.lovable.app)
+    return ALLOWED_ORIGINS.some((d) => d && (host === d || host.endsWith("." + d)));
+  } catch {
+    return false;
+  }
+}
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (originAllowed(origin)) return cb(null, true);
+      return cb(new Error("CORS: origin not allowed"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-ia11-key"],
+    credentials: false,
+    maxAge: 86400,
+  })
+);
+
+// Preflight must return OK
+app.options("*", cors());
 
 // =====================
 // Utilities
@@ -122,6 +167,8 @@ function pickT(lang) {
 function isAllowedBrowser(req) {
   const origin = safeStr(req.headers.origin, 300).toLowerCase();
   const referer = safeStr(req.headers.referer, 500).toLowerCase();
+  // If bypass enabled, we still require the browser to come from allowed origins.
+  // This is a fallback only. For "world" security, keep bypass = false.
   const hay = `${origin} ${referer}`;
   return ALLOWED_ORIGINS.some((d) => d && hay.includes(d));
 }
@@ -131,6 +178,7 @@ function requireKey(req, res, next) {
 
   const key = safeStr(req.header("x-ia11-key"), 200);
 
+  // Bypass is OFF by default. If ever ON, it is origin-limited.
   if (ALLOW_FRONTEND_BYPASS && isAllowedBrowser(req)) return next();
 
   if (!API_KEY || key !== API_KEY) {
@@ -304,6 +352,9 @@ async function serperSearch(query, uiLanguage) {
   if (!SERPER_API_KEY) {
     return { ok: false, items: [], error: "Missing SERPER_API_KEY" };
   }
+  if (!_fetch) {
+    return { ok: false, items: [], error: "Missing fetch runtime (node-fetch not installed)" };
+  }
 
   const lang = detectUiLanguage(uiLanguage);
   const hl = lang === "en" ? "en" : "fr";
@@ -313,7 +364,7 @@ async function serperSearch(query, uiLanguage) {
   const cached = cacheGet(cacheKey);
   if (cached) return { ok: true, items: cached, error: null, cached: true };
 
-  const r = await fetch("https://google.serper.dev/search", {
+  const r = await _fetch("https://google.serper.dev/search", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -372,7 +423,6 @@ async function serperMultiSearch(text, mode, uiLanguage) {
 
 // =====================
 // CONTRADICTION CHECK (lightweight but effective for obvious lies)
-// Works off Serper snippets (no LLM).
 // =====================
 function normalizeTextForMatch(s) {
   return safeStr(s, 2000).toLowerCase().replace(/\s+/g, " ").trim();
@@ -382,13 +432,11 @@ function extractSimpleClaim(text, lang) {
   const t = safeStr(text, 800).trim();
   const lower = t.toLowerCase();
 
-  // FR: "X est une Y" / "X est un Y"
   if (lang === "fr") {
     const m = lower.match(/^(.{2,60})\s+est\s+(une|un)\s+(.{2,80})$/i);
     if (m) return { subject: m[1].trim(), object: m[3].trim(), kind: "is-a" };
   }
 
-  // EN: "X is a Y" / "X is an Y"
   if (lang === "en") {
     const m = lower.match(/^(.{2,60})\s+is\s+(a|an)\s+(.{2,80})$/i);
     if (m) return { subject: m[1].trim(), object: m[3].trim(), kind: "is-a" };
@@ -412,7 +460,6 @@ function typeFromObject(objLower) {
 
 function snippetSaysType(subjectLower, snippetLower, typeKey) {
   const words = TYPE_GROUPS[typeKey] || [];
-  // must mention subject + one of the type words near-ish
   if (!snippetLower.includes(subjectLower)) return false;
   return words.some((w) => snippetLower.includes(w));
 }
@@ -428,11 +475,7 @@ function assessContradiction(text, sources, lang) {
   const objL = object.toLowerCase();
 
   const claimedType = typeFromObject(objL);
-  if (!claimedType) {
-    // still can catch obvious "Canada is a city" vs snippets "Canada is a country"
-    // but if object doesn't contain a type keyword, skip.
-    return { detected: false, strength: 0, note: null };
-  }
+  if (!claimedType) return { detected: false, strength: 0, note: null };
 
   const snippets = sources.map((s) => normalizeTextForMatch(`${s.title} ${s.snippet}`));
 
@@ -440,15 +483,12 @@ function assessContradiction(text, sources, lang) {
   let oppose = 0;
 
   for (const sn of snippets) {
-    // support: subject + claimed type appears
     if (snippetSaysType(subjL, sn, claimedType)) support += 1;
 
-    // oppose: subject + opposite type appears
     if (claimedType === "city" && snippetSaysType(subjL, sn, "country")) oppose += 1;
     if (claimedType === "country" && snippetSaysType(subjL, sn, "city")) oppose += 1;
   }
 
-  // Strong contradiction when opposite appears >=2 and support is 0
   if (oppose >= 2 && support === 0) {
     return {
       detected: true,
@@ -459,7 +499,6 @@ function assessContradiction(text, sources, lang) {
     };
   }
 
-  // Medium contradiction when oppose > support
   if (oppose > support) {
     return {
       detected: true,
@@ -470,7 +509,6 @@ function assessContradiction(text, sources, lang) {
     };
   }
 
-  // No contradiction
   return { detected: false, strength: 0, note: null, support, oppose };
 }
 
@@ -495,8 +533,6 @@ function computeEvidence(sources) {
 function buildBreakdown(lang, evidence, textLen, contradiction) {
   const t = pickT(lang);
 
-  // points are 0..20 each (UI doesn't care exact max; it cares consistency + reasons)
-  // We'll output meaningful reasons so your UI looks "alive".
   let sourcesPts = 0;
   if (evidence.label === "strong") sourcesPts = 18;
   else if (evidence.label === "medium") sourcesPts = 12;
@@ -509,10 +545,9 @@ function buildBreakdown(lang, evidence, textLen, contradiction) {
 
   let contextPts = textLen >= 220 ? 16 : textLen >= 90 ? 12 : textLen >= 40 ? 8 : 4;
 
-  // "tone" here is really "prudence" in your UI mapping
-  let tonePts = 12; // default: cautious
-  if (contradiction.detected) tonePts = 14; // more cautious
-  if (evidence.label === "strong" && !contradiction.detected) tonePts = 10; // less cautious
+  let tonePts = 12;
+  if (contradiction.detected) tonePts = 14;
+  if (evidence.label === "strong" && !contradiction.detected) tonePts = 10;
 
   let transparencyPts = evidence.sCount >= 3 ? 14 : evidence.sCount >= 1 ? 10 : 6;
 
@@ -529,50 +564,41 @@ function buildBreakdown(lang, evidence, textLen, contradiction) {
 }
 
 function scoreFromSignals(textLen, evidence, contradiction, mode) {
-  // Start wider so we don’t live in 45–55 hell.
   let score = 60;
 
-  // Context
   if (textLen < 40) score -= 20;
   else if (textLen < 90) score -= 10;
   else if (textLen > 220) score += 6;
 
-  // Evidence
   if (evidence.label === "strong") score += 18;
   else if (evidence.label === "medium") score += 10;
   else if (evidence.sCount >= 1) score += 3;
   else score -= 18;
 
-  // Trust sum nudges
   if (evidence.trustSum >= 6) score += 8;
   else if (evidence.trustSum >= 3) score += 4;
   else if (evidence.trustSum >= 1) score += 1;
 
-  // CONTRADICTION overrides hard (this is your “credibility” core)
   if (contradiction.detected && contradiction.strength >= 3) score = Math.min(score, 22);
   else if (contradiction.detected && contradiction.strength >= 2) score = Math.min(score, 32);
   else if (contradiction.detected) score = Math.min(score, 45);
 
-  // PRO is stricter: if weak evidence, don’t inflate
   if (mode === "pro" && evidence.label === "weak") score -= 6;
 
   score = clamp(Math.round(score), 5, 98);
 
-  // Confidence 0.10..0.95
   let confidence = 0.55;
   if (evidence.label === "strong") confidence += 0.25;
   if (evidence.label === "medium") confidence += 0.15;
   if (evidence.sCount === 0) confidence -= 0.20;
   if (textLen < 40) confidence -= 0.10;
-  if (contradiction.detected) confidence += 0.05; // we’re confident when we see contradiction
+  if (contradiction.detected) confidence += 0.05;
   confidence = clamp(Number(confidence.toFixed(2)), 0.1, 0.95);
 
-  // Risk
   let riskLevel = "medium";
   if (score >= 80) riskLevel = "low";
   if (score <= 45) riskLevel = "high";
 
-  // Corroboration outcome
   let outcome = "uncertain";
   if (contradiction.detected && contradiction.strength >= 2) outcome = "contradicted";
   else if (!contradiction.detected && evidence.label === "strong") outcome = "confirmed";
@@ -644,6 +670,8 @@ app.get("/", (req, res) => {
     message: "IA11 PRO is up",
     bypassEnabled: ALLOW_FRONTEND_BYPASS,
     allowedOrigins: ALLOWED_ORIGINS,
+    hasSerper: Boolean(SERPER_API_KEY),
+    hasApiKey: Boolean(API_KEY),
   });
 });
 
@@ -673,7 +701,6 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
     });
   }
 
-  // LOG: you will see requests now (if your UI truly hits Render)
   console.log(`[IA11] req=${requestId} mode=${mode} lang=${lang} len=${text.trim().length}`);
 
   let rawSources = [];
@@ -707,7 +734,6 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
 
   const tookMs = nowMs() - t0;
 
-  // Corroboration object for your UI "Points clés PRO"
   const corroboration = {
     outcome:
       scored.outcome === "confirmed" ? t.outcomeConfirmed :

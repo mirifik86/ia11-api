@@ -45,8 +45,9 @@ app.get("/", (req, res) => {
 });
 
 // ================= SERPER SEARCH =================
-
 async function serperSearch(query, lang) {
+  console.log("🔎 SERPER QUERY:", query);   // <-- AJOUT
+
   try {
     const r = await _fetch("https://google.serper.dev/search", {
       method: "POST",
@@ -57,14 +58,17 @@ async function serperSearch(query, lang) {
       body: JSON.stringify({ q: query, gl: "us", hl: lang || "en" }),
     });
 
-    if (!r.ok) return { ok: false, error: "Serper error" };
     const j = await r.json();
+
+    console.log("📥 SERPER RESULTS:", (j.organic || []).length); // <-- AJOUT
 
     return { ok: true, items: (j.organic || []).slice(0, 5) };
   } catch (e) {
+    console.log("❌ SERPER ERROR:", e.message); // <-- AJOUT
     return { ok: false, error: e.message };
   }
 }
+
 
 // ================= IA11 PRO CORE (Claims + Evidence + Scoring) =================
 

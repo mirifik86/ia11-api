@@ -765,17 +765,21 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
 
 
   try {
-    forceFresh = mode === "pro" && looksTimeSensitive(text);
-const out = await serperMultiSearch(text, mode, lang, { forceFresh });
-cachedUsed = !!out.cachedUsed;
+  forceFresh = mode === "pro" && looksTimeSensitive(text);
+  const out = await serperMultiSearch(text, mode, lang, { forceFresh });
 
-    rawSources = out.items || [];
-    searchError = out.error || null;
-    queriesUsed = out.queries || [];
-  } catch (e) {
-    searchOk = false;
-    searchError = e?.message || "Unknown search error";
-  }
+  searchOk = out.ok;
+  cachedUsed = out.cachedUsed;
+
+  rawSources = out.items || [];
+  searchError = out.error || null;
+  queriesUsed = out.queries || [];
+
+} catch (e) {
+  searchOk = false;
+  searchError = e?.message || "Unknown search error";
+}
+
 
   sources = cleanSources(rawSources);
   const evidence = computeEvidence(sources);

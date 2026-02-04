@@ -317,30 +317,12 @@ async function serperSearch(query, uiLanguage, opts = {}) {
     .filter((x) => x.url && x.title);
 
   if (!noCache) cacheSet(cacheKey, items);
+  
   return { ok: true, items, error: null, cached: false };
 }
 
 
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    return { ok: false, items: [], error: `Serper error ${r.status}: ${txt.slice(0, 200)}` };
-  }
-
-  const json = await r.json();
-  const organic = Array.isArray(json?.organic) ? json.organic : [];
-
-  const items = organic
-    .map((x) => ({
-      title: safeStr(x?.title, 200),
-      url: safeStr(x?.link, 600),
-      snippet: safeStr(x?.snippet, 500),
-    }))
-    .filter((x) => x.url && x.title);
-
-  cacheSet(cacheKey, items);
-  return { ok: true, items, error: null, cached: false };
-}
-
+  
 // =====================
 // Query building (PRO = smarter)
 // =====================

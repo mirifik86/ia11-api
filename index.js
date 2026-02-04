@@ -70,8 +70,9 @@ async function serperSearch(query, lang) {
 }
 
 
-// ================= IA11 PRO CORE (Claims + Evidence + Scoring) =================
+// ================= IA11 PRO CORE (Brutal Standard + WOW PRO) =================
 
+// Helpers
 function safeLower(v) {
   return (v || "").toString().toLowerCase();
 }
@@ -94,7 +95,7 @@ function getDomain(u) {
   }
 }
 
-// Petit classement simple (ça évite de donner le même poids à un blog random qu’à un site officiel)
+// Petit classement simple (évite de donner le même poids à un blog random qu’à un site officiel)
 function domainReliability(domain) {
   const d = safeLower(domain);
 
@@ -148,55 +149,209 @@ function dedupeItems(items) {
   return out;
 }
 
-// Découpe simple en “claims” (max 3). Ça évite d’analyser un pavé comme une seule phrase.
-function extractClaims(text) {
-  const t = (text || "").trim();
-  if (!t) return [];
+// ---------------- STANDARD (0 Serper) : brutal, intelligent, honnête ----------------
 
-  const raw = t
-    .replace(/\s+/g, " ")
-    .split(/(?<=[.!?])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  // Si c’est court → 1 claim
-  if (t.length < 180) return [t];
-
-  // Sinon → 2-3 claims max
-  return raw.slice(0, 3);
+function hasUserProvidedSources(text) {
+  const t = safeLower(text);
+  return (
+    t.includes("http://") ||
+    t.includes("https://") ||
+    t.includes("www.") ||
+    t.includes("source:") ||
+    t.includes("sources:") ||
+    t.includes("selon ") ||
+    t.includes("according to ")
+  );
 }
 
-function buildQueriesForClaim(claim, uiLanguage, mode) {
-  const lang = (uiLanguage || "en").toLowerCase();
-  const isFr = lang.startsWith("fr");
-  const isPro = safeLower(mode) === "pro";
+function looksLikeVerifiableClaim(text) {
+  const t = safeLower(text);
 
-  const proExtras = isFr
-    ? [
-        `${claim} source officielle`,
-        `${claim} communiqué officiel`,
-        `${claim} vérification des faits`,
-      ]
-    : [
-        `${claim} official source`,
-        `${claim} press release`,
-        `${claim} fact check`,
-      ];
+  // Indices simples de “fait vérifiable”
+  const hasNumbers = /\d/.test(t);
+  const hasYear = /\b(19\d{2}|20\d{2})\b/.test(t);
 
-  const base = [
-    claim,
-    `"${claim}"`,
+  const highRiskKeywords = [
+    "président",
+    "president",
+    "premier ministre",
+    "prime minister",
+    "pape",
+    "pope",
+    "élection",
+    "election",
+    "guerre",
+    "war",
+    "ministre",
+    "minister",
+    "gouvernement",
+    "government",
+    "chef d'état",
+    "head of state",
+    "maire",
+    "mayor",
+    "ceo",
+    "pdg",
   ];
 
-  // Standard = moins de requêtes, PRO = plus de profondeur
-  return isPro ? base.concat(proExtras).slice(0, 5) : base.slice(0, 2);
+  const verbFact = [
+    "est ",
+    "sont ",
+    "was ",
+    "were ",
+    "is ",
+    "are ",
+    "a été",
+    "ont été",
+    "depuis",
+    "since",
+    "in ",
+  ];
+
+  const kwHit = highRiskKeywords.some((k) => t.includes(k));
+  const verbHit = verbFact.some((v) => t.includes(v));
+
+  // Si c’est court + contient structure factuelle → vérifiable
+  if (t.length < 220 && (kwHit || hasNumbers || hasYear) && verbHit) return true;
+
+  // Même si plus long, si mots “poste officiel” + verbes factuels
+  if (kwHit && verbHit) return true;
+
+  return false;
 }
 
-function stanceFromSnippet(snippet) {
-  const s = safeLower(snippet);
+function computeWritingScore(text) {
+  const t = (text || "").trim();
+  if (!t) return 0;
 
-  const refuteWords = ["false", "debunk", "hoax", "myth", "not true", "refuted", "misleading", "fake", "faux", "canular", "démenti", "dementi", "trompeur"];
-  const supportWords = ["confirmed", "official", "announced", "statement", "report", "according to", "communiqué", "communique", "déclare", "declare", "rapport"];
+  let score = 70;
+
+  const lower = safeLower(t);
+
+  // Pénalités “style manipulation”
+  const exclam = (t.match(/!/g) || []).length;
+  const allCapsRatio =
+    t.length > 30 ? (t.replace(/[^A-Z]/g, "").length / t.length) : 0;
+
+  if (exclam >= 3) score -= 12;
+  if (allCapsRatio > 0.25) score -= 15;
+  if (lower.includes("100%") || lower.includes("certain") || lower.includes("c'est sûr") || lower.includes("proof")) score -= 8;
+
+  // Bonus “prudence”
+  if (lower.includes("il semble") || lower.includes("probablement") || lower.includes("peut-être") || lower.includes("selon") || lower.includes("à ce stade")) score += 6;
+
+  // Pénalité si ultra court
+  if (t.length < 20) score -= 12;
+
+  // Clamp
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  return score;
+}
+
+function computeStandard(text, lang) {
+  const writingScore = computeWritingScore(text);
+  const providedSources = hasUserProvidedSources(text);
+  const verifiable = looksLikeVerifiableClaim(text);
+
+  // Risque factuel (wow: clair et assumé)
+  let factualRisk = "Low";
+  if (verifiable && !providedSources) factualRisk = "High";
+  else if (verifiable) factualRisk = "Medium";
+
+  // Score final Standard = brutal si fait vérifiable sans source
+  let final = writingScore;
+
+  let cap = 100;
+  let capReason = null;
+
+  if (factualRisk === "High") {
+    cap = 35;
+    capReason = "Verifiable factual claim without any provided source.";
+  } else if (factualRisk === "Medium") {
+    cap = 55;
+    capReason = "Verifiable claim with limited/unclear sourcing.";
+  }
+
+  final = Math.min(final, cap);
+
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  const summary = fr
+    ? (factualRisk === "High"
+        ? "Affirmation vérifiable sans preuve fournie. Score Standard volontairement sévère."
+        : "Analyse Standard : formulation + risque de crédibilité (sans vérification web).")
+    : (factualRisk === "High"
+        ? "Verifiable claim without proof provided. Standard score is intentionally strict."
+        : "Standard analysis: writing + credibility risk (no web verification).");
+
+  return {
+    score: final,
+    summary,
+    standard: {
+      writingScore,
+      factualRisk: fr ? (factualRisk === "High" ? "Élevé" : factualRisk === "Medium" ? "Moyen" : "Faible") : factualRisk,
+      capApplied: cap,
+      capReason: capReason
+        ? (fr
+            ? "Affirmation hautement vérifiable sans source dans le texte. Standard = formulation + risque, pas les faits."
+            : "Highly verifiable claim with no source in text. Standard = writing + risk, not factual verification.")
+        : null,
+    },
+    sources: [], // Standard = 0 sources web
+  };
+}
+
+// ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
+
+// Mini cache mémoire (évite de payer Serper 20 fois pour la même phrase)
+const PRO_CACHE = new Map(); // key -> { expiresAt, payload }
+const PRO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+
+function cacheGet(key) {
+  const v = PRO_CACHE.get(key);
+  if (!v) return null;
+  if (Date.now() > v.expiresAt) {
+    PRO_CACHE.delete(key);
+    return null;
+  }
+  return v.payload;
+}
+
+function cacheSet(key, payload) {
+  PRO_CACHE.set(key, { expiresAt: Date.now() + PRO_CACHE_TTL_MS, payload });
+}
+
+function normalizeClaimForCache(text, lang) {
+  const t = safeLower(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .trim()
+    .slice(0, 220);
+  return `${(lang || "en").toLowerCase()}::${t}`;
+}
+
+function extractMainClaim(text) {
+  const t = (text || "").trim();
+  if (!t) return "";
+  // prend la 1re phrase courte (sinon début)
+  const parts = t.replace(/\s+/g, " ").split(/(?<=[.!?])\s+/).filter(Boolean);
+  return (parts[0] || t).trim().slice(0, 240);
+}
+
+function stanceFromText(snippetOrTitle) {
+  const s = safeLower(snippetOrTitle);
+
+  const refuteWords = [
+    "false", "debunk", "hoax", "myth", "not true", "refuted", "misleading", "fake",
+    "faux", "canular", "démenti", "dementi", "trompeur", "incorrect", "inexact"
+  ];
+
+  const supportWords = [
+    "confirmed", "official", "announced", "statement", "report", "according to",
+    "communiqué", "communique", "déclare", "declare", "rapport", "evidence", "verified"
+  ];
 
   let refute = 0;
   let support = 0;
@@ -209,209 +364,374 @@ function stanceFromSnippet(snippet) {
   return "unknown";
 }
 
-function scoreEvidence(items, claimCount) {
-  const list = items || [];
-  if (list.length === 0) {
-    return { score: 45, confidence: 20, notes: ["no_sources"] };
+// Requêtes PRO: max 3, ultra ciblées
+function buildProQueries(claim, lang) {
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+  const c = (claim || "").trim();
+  const lower = safeLower(c);
+
+  const queries = [];
+
+  // 1) La claim brute (toujours)
+  if (c) queries.push(c);
+
+  // 2) Si ça ressemble à un poste officiel → requête “current + poste”
+  const looksOfficial =
+    lower.includes("président") ||
+    lower.includes("president") ||
+    lower.includes("prime minister") ||
+    lower.includes("premier ministre") ||
+    lower.includes("pape") ||
+    lower.includes("pope");
+
+  if (looksOfficial) {
+    queries.push(fr ? `président actuel ${c}` : `current ${c}`);
+  } else {
+    // sinon fact-check simple
+    queries.push(fr ? `${c} vérification des faits` : `${c} fact check`);
   }
 
-  // Qualité moyenne des domaines + diversité
+  // 3) Requête “official source” (seulement si pro et claim pas trop longue)
+  if (c && c.length < 160) {
+    queries.push(fr ? `${c} source officielle` : `${c} official source`);
+  }
+
+  return queries.slice(0, 3);
+}
+
+function scoreEvidenceBrutal(enrichedItems) {
+  const list = enrichedItems || [];
+  if (list.length === 0) {
+    return {
+      evidenceScore: 45,
+      confidence: 20,
+      hasContradictions: false,
+      strongRefute: false,
+      strongSupport: false,
+      notes: ["no_sources"],
+    };
+  }
+
+  // Stats
   const domains = new Set();
   let relSum = 0;
 
   let support = 0;
   let refute = 0;
+  let unknown = 0;
 
   for (const it of list) {
-    const domain = getDomain(it.link || it.url || "");
-    const rel = domainReliability(domain);
+    const rel = it.reliability || 50;
     relSum += rel;
-    if (domain) domains.add(domain);
+    if (it.domain) domains.add(it.domain);
 
-    const stance = stanceFromSnippet(it.snippet || it.description || "");
+    const stance = it.stance || "unknown";
     if (stance === "support") support++;
-    if (stance === "refute") refute++;
+    else if (stance === "refute") refute++;
+    else unknown++;
   }
 
   const avgRel = relSum / Math.max(1, list.length);
   const diversity = domains.size;
 
-  // Contradiction simple : il y a du “support” ET du “refute”
-  const contradictions = support > 0 && refute > 0;
+  const hasContradictions = support > 0 && refute > 0;
 
-  // Score principal
-  let score = 50;
+  // “Forte contradiction” = refute domine + sources pas mauvaises
+  const strongRefute = refute >= Math.max(2, support + 1) && avgRel >= 70;
+  const strongSupport = support >= Math.max(2, refute + 1) && avgRel >= 70;
 
-  // Fiabilité
-  if (avgRel >= 85) score += 22;
-  else if (avgRel >= 70) score += 14;
-  else score += 6;
+  // Score evidence brut
+  let evidenceScore = 50;
 
-  // Diversité (évite 5 résultats du même site)
-  if (diversity >= 6) score += 18;
-  else if (diversity >= 4) score += 12;
-  else if (diversity >= 2) score += 6;
+  // Qualité
+  if (avgRel >= 85) evidenceScore += 20;
+  else if (avgRel >= 70) evidenceScore += 12;
+  else evidenceScore += 6;
 
-  // Volume (sans sur-valoriser)
-  if (list.length >= 10) score += 6;
-  else if (list.length >= 5) score += 3;
+  // Diversité
+  if (diversity >= 5) evidenceScore += 12;
+  else if (diversity >= 3) evidenceScore += 8;
+  else if (diversity >= 2) evidenceScore += 4;
 
-  // Pénalité contradictions
-  if (contradictions) score -= 14;
+  // Pénalités
+  if (hasContradictions) evidenceScore -= 10;
 
-  // Pénalité si plusieurs claims mais peu de preuves
-  if (claimCount >= 2 && list.length < 5) score -= 6;
+  // Verdict brutal
+  if (strongRefute) evidenceScore = Math.min(evidenceScore, 12);
+  if (strongSupport) evidenceScore = Math.max(evidenceScore, 80);
 
-  // Clamp 0-100
-  score = Math.max(0, Math.min(100, Math.round(score)));
+  evidenceScore = Math.max(0, Math.min(100, Math.round(evidenceScore)));
 
-  // Confiance (différent du score)
-  let confidence = 30;
+  // Confiance
+  let confidence = 35;
   confidence += Math.round((avgRel - 50) * 0.6);
-  confidence += Math.min(20, diversity * 3);
-  if (contradictions) confidence -= 15;
-  confidence = Math.max(0, Math.min(100, confidence));
+  confidence += Math.min(20, diversity * 4);
+  if (hasContradictions) confidence -= 10;
+  if (strongRefute || strongSupport) confidence += 10;
+  confidence = Math.max(0, Math.min(100, Math.round(confidence)));
 
   const notes = [];
-  if (contradictions) notes.push("contradictions_detected");
+  if (hasContradictions) notes.push("mixed_signals");
+  if (strongRefute) notes.push("strong_refutation");
+  if (strongSupport) notes.push("strong_corroboration");
   if (avgRel >= 85) notes.push("high_quality_sources");
-  if (diversity >= 4) notes.push("diverse_sources");
 
-  return { score, confidence, notes };
+  return { evidenceScore, confidence, hasContradictions, strongRefute, strongSupport, notes };
 }
 
-function makeSummary(lang, score, confidence, hasContradictions) {
+function buildProExplanation(lang, claim, evidence, buckets) {
   const l = (lang || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
+  const { strongRefute, strongSupport, hasContradictions, confidence } = evidence;
+
   if (fr) {
-    if (score >= 80 && confidence >= 70 && !hasContradictions)
-      return "Sources nombreuses et fiables. Cohérence élevée.";
-    if (hasContradictions)
-      return "Sources partagées ou contradictoires. Prudence recommandée.";
-    if (score >= 65)
-      return "Plusieurs sources trouvées, crédibilité modérée à bonne.";
-    return "Peu de preuves solides trouvées. Crédibilité faible à vérifier.";
+    if (strongRefute) {
+      return `Analyse des éléments disponibles : les sources consultées contredisent clairement l’affirmation (« ${claim} »). À ce stade, elle apparaît très probablement incorrecte. Niveau de confiance : ${confidence}/100. Limite : cette conclusion dépend des sources accessibles publiquement au moment de l’analyse.`;
+    }
+    if (strongSupport) {
+      return `Analyse des éléments disponibles : plusieurs sources fiables corroborent l’affirmation (« ${claim} »). À ce stade, elle apparaît probablement correcte. Niveau de confiance : ${confidence}/100. Limite : la qualité dépend des sources accessibles publiquement au moment de l’analyse.`;
+    }
+    if (hasContradictions) {
+      return `Analyse des éléments disponibles : les sources consultées présentent des signaux partagés autour de l’affirmation (« ${claim} »). À ce stade, prudence recommandée. Niveau de confiance : ${confidence}/100.`;
+    }
+    return `Analyse des éléments disponibles : les sources consultées apportent des éléments limités ou indirects sur l’affirmation (« ${claim} »). À ce stade, impossible de conclure solidement. Niveau de confiance : ${confidence}/100.`;
   } else {
-    if (score >= 80 && confidence >= 70 && !hasContradictions)
-      return "Many reliable sources found. High consistency.";
-    if (hasContradictions)
-      return "Sources appear mixed or contradictory. Caution recommended.";
-    if (score >= 65)
-      return "Several sources found, moderate to good credibility.";
-    return "Limited solid evidence found. Low credibility, needs verification.";
+    if (strongRefute) {
+      return `Evidence review: consulted sources clearly contradict the claim ("${claim}"). At this stage, it appears very likely incorrect. Confidence: ${confidence}/100. Limitation: depends on publicly available sources at analysis time.`;
+    }
+    if (strongSupport) {
+      return `Evidence review: multiple reliable sources corroborate the claim ("${claim}"). At this stage, it appears likely correct. Confidence: ${confidence}/100. Limitation: depends on publicly available sources at analysis time.`;
+    }
+    if (hasContradictions) {
+      return `Evidence review: consulted sources show mixed signals around the claim ("${claim}"). Caution is recommended. Confidence: ${confidence}/100.`;
+    }
+    return `Evidence review: consulted sources provide limited or indirect support regarding the claim ("${claim}"). No solid conclusion can be made. Confidence: ${confidence}/100.`;
   }
 }
 
-async function serperMultiSearch(text, mode, uiLanguage, opts = {}) {
-  const claims = extractClaims(text);
-  const allQueries = [];
+async function runProEvidence(text, lang) {
+  const claim = extractMainClaim(text);
+  const cacheKey = normalizeClaimForCache(claim, lang);
+  const cached = cacheGet(cacheKey);
+  if (cached) return { ...cached, fromCache: true };
+
+  const queries = buildProQueries(claim, lang);
+
   let allItems = [];
   let okCount = 0;
   let lastError = null;
 
-  // PRO = plus de profondeur, Standard = plus léger
-  const isPro = safeLower(mode) === "pro";
-
-  for (const claim of claims) {
-    const queries = buildQueriesForClaim(claim, uiLanguage, isPro ? "pro" : "standard");
-    allQueries.push(...queries);
-
-    for (const q of queries) {
-      try {
-        const out = await serperSearch(q, uiLanguage);
-        if (out.ok) {
-          okCount++;
-          allItems = allItems.concat(out.items || []);
-        } else {
-          lastError = out.error || lastError;
-        }
-      } catch (e) {
-        lastError = e?.message || lastError;
+  // Max 3 requêtes, et on s’arrête tôt si on a déjà assez de matière
+  for (const q of queries) {
+    try {
+      const out = await serperSearch(q, lang);
+      if (out.ok) {
+        okCount++;
+        allItems = allItems.concat(out.items || []);
+      } else {
+        lastError = out.error || lastError;
       }
+    } catch (e) {
+      lastError = e?.message || lastError;
     }
+
+    // Stop early: si on a déjà 8 items dédupliqués, c’est suffisant pour un verdict pro
+    const fastDedup = dedupeItems(allItems);
+    if (fastDedup.length >= 8) break;
   }
 
-  // Dédup + enrichissement domain + reliability
-  const deduped = dedupeItems(allItems).slice(0, isPro ? 12 : 6);
+  const deduped = dedupeItems(allItems).slice(0, 10);
   const enriched = deduped.map((it) => {
     const link = it.link || it.url || "";
     const domain = getDomain(link);
+    const title = it.title || "";
+    const snippet = it.snippet || it.description || "";
+    const reliability = domainReliability(domain);
+    const stance = stanceFromText(`${title} ${snippet}`);
+
     return {
-      title: it.title || "",
-      link,
-      snippet: it.snippet || it.description || "",
+      title,
+      url: link,
+      link, // compat
+      snippet,
       domain,
-      reliability: domainReliability(domain),
+      reliability,
+      stance,
     };
   });
 
-  // Contradictions globales (simple)
-  let support = 0;
-  let refute = 0;
+  // Buckets (wow)
+  const buckets = { corroborates: [], contradicts: [], neutral: [] };
   for (const it of enriched) {
-    const stance = stanceFromSnippet(it.snippet || "");
-    if (stance === "support") support++;
-    if (stance === "refute") refute++;
+    if (it.stance === "support") buckets.corroborates.push(it);
+    else if (it.stance === "refute") buckets.contradicts.push(it);
+    else buckets.neutral.push(it);
   }
-  const hasContradictions = support > 0 && refute > 0;
 
-  const scoring = scoreEvidence(enriched, claims.length);
+  const evidence = scoreEvidenceBrutal(enriched);
 
-  return {
+  const payload = {
     ok: okCount > 0,
-    claims,
+    claim,
+    queriesUsed: queries,
     items: enriched,
-    hasContradictions,
-    score: scoring.score,
-    confidence: scoring.confidence,
-    notes: scoring.notes,
+    buckets,
+    evidence,
     error: okCount > 0 ? null : lastError || "Unknown search error",
-    queries: allQueries,
   };
+
+  cacheSet(cacheKey, payload);
+  return { ...payload, fromCache: false };
 }
+
+function computeProFinalScore(text, lang, writingScore, evidenceScore, strongRefute, verifiable) {
+  // Score PRO = 80% preuve + 20% écriture (ultra logique)
+  let pro = Math.round(0.2 * writingScore + 0.8 * evidenceScore);
+
+  // Règle anti-absurde : si forte contradiction, ça ne monte JAMAIS
+  if (strongRefute) pro = Math.min(pro, 15);
+
+  // Si c’est non vérifiable (opinion), on évite de “punir” trop fort
+  if (!verifiable && pro < 35) pro = 35;
+
+  // Clamp
+  pro = Math.max(0, Math.min(100, pro));
+  return pro;
+}
+
+function labelFromScore(lang, score) {
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  if (fr) {
+    if (score >= 80) return "HAUTE CRÉDIBILITÉ";
+    if (score >= 65) return "BONNE CRÉDIBILITÉ";
+    if (score >= 50) return "CRÉDIBILITÉ MODÉRÉE";
+    if (score >= 30) return "FAIBLE CRÉDIBILITÉ";
+    return "TRÈS FAIBLE CRÉDIBILITÉ";
+  } else {
+    if (score >= 80) return "HIGH CREDIBILITY";
+    if (score >= 65) return "GOOD CREDIBILITY";
+    if (score >= 50) return "MODERATE CREDIBILITY";
+    if (score >= 30) return "LOW CREDIBILITY";
+    return "VERY LOW CREDIBILITY";
+  }
+}
+
+// ---------------- ROUTE ----------------
 
 app.post("/v1/analyze", async (req, res) => {
   try {
     if (req.headers["x-ia11-key"] !== IA11_KEY)
       return res.status(401).json({ error: "Invalid key" });
 
-    if (!SERPER_KEY)
-      return res.status(500).json({ error: "Missing SERPER_API_KEY" });
-
     const { text, mode, language } = req.body;
     if (!text) return res.status(400).json({ error: "Text required" });
 
-    // mode attendu: "standard" ou "pro"
     const normalizedMode = safeLower(mode) === "pro" ? "pro" : "standard";
 
-    const search = await serperMultiSearch(text, normalizedMode, language);
+    // STANDARD: 0 Serper
+    if (normalizedMode === "standard") {
+      const standardOut = computeStandard(text, language);
 
-    const summary = makeSummary(
+      return res.json({
+        status: "ok",
+        engine: "IA11 Ultra Pro",
+        result: {
+          mode: "standard",
+          score: standardOut.score,
+          label: labelFromScore(language, standardOut.score),
+          summary: standardOut.summary,
+          sources: [], // Standard = aucun lien web
+          standard: standardOut.standard,
+        },
+      });
+    }
+
+    // PRO: nécessite Serper
+    if (!SERPER_KEY)
+      return res.status(500).json({ error: "Missing SERPER_API_KEY" });
+
+    const writingScore = computeWritingScore(text);
+    const verifiable = looksLikeVerifiableClaim(text);
+
+    const proSearch = await runProEvidence(text, language);
+
+    const evidenceScore = proSearch.evidence.evidenceScore;
+    const confidence = proSearch.evidence.confidence;
+    const strongRefute = proSearch.evidence.strongRefute;
+
+    const finalScore = computeProFinalScore(
+      text,
       language,
-      search.score,
-      search.confidence,
-      !!search.hasContradictions
+      writingScore,
+      evidenceScore,
+      strongRefute,
+      verifiable
     );
 
-    res.json({
+    const explanation = buildProExplanation(
+      language,
+      proSearch.claim,
+      proSearch.evidence,
+      proSearch.buckets
+    );
+
+    const l = (language || "en").toLowerCase();
+    const fr = l.startsWith("fr");
+
+    const summary = fr
+      ? (strongRefute
+          ? "Sources fiables consultées : contradiction forte. Crédibilité très faible."
+          : "Analyse PRO basée sur preuves : sources consultées et justification détaillée.")
+      : (strongRefute
+          ? "Reliable sources consulted: strong contradiction. Very low credibility."
+          : "PRO evidence-based analysis: sources consulted and detailed justification.");
+
+    // Sources cliquables (title + url + domain)
+    const sources = (proSearch.items || []).slice(0, 8).map((it) => ({
+      title: it.title,
+      url: it.url,
+      domain: it.domain,
+      reliability: it.reliability,
+      stance: it.stance,
+      snippet: it.snippet,
+    }));
+
+    return res.json({
       status: "ok",
       engine: "IA11 Ultra Pro",
       result: {
-        // Champs “compatibles Lovable”
-        score: search.score,
+        mode: "pro",
+        score: finalScore,
+        label: labelFromScore(language, finalScore),
         summary,
-        sources: search.items || [],
-
-        // Champs “bonus” (Lovable peut les ignorer)
-        confidence: search.confidence,
-        claims: search.claims || [],
-        notes: search.notes || [],
-        contradictions: !!search.hasContradictions,
-        queriesUsed: (search.queries || []).slice(0, 10),
-        mode: normalizedMode,
+        confidence,
+        pro: {
+          writingScore,
+          evidenceScore,
+          strongRefute,
+          explanation,
+          claim: proSearch.claim,
+          buckets: {
+            corroborates: (proSearch.buckets.corroborates || []).slice(0, 3),
+            contradicts: (proSearch.buckets.contradicts || []).slice(0, 3),
+            neutral: (proSearch.buckets.neutral || []).slice(0, 3),
+          },
+          queriesUsed: proSearch.queriesUsed,
+          fromCache: proSearch.fromCache,
+          notes: proSearch.evidence.notes || [],
+        },
+        sources, // <-- Lovable peut afficher ça en liens cliquables
       },
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

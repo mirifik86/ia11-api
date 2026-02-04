@@ -622,6 +622,8 @@ function labelFromScore(lang, score) {
 
 // ---------------- ROUTE ----------------
 
+// ---------------- ROUTE ----------------
+
 app.post("/v1/analyze", async (req, res) => {
   try {
     if (req.headers["x-ia11-key"] !== IA11_KEY)
@@ -728,12 +730,7 @@ app.post("/v1/analyze", async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
 });
 

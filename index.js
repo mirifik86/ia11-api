@@ -43,15 +43,17 @@ const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
 
-// ---------- fetch safety ----------
-let _fetch = global.fetch;
-if (!_fetch) {
-  try {
-    _fetch = require("node-fetch");
-  } catch (e) {
-    _fetch = null;
-  }
+// ---------- fetch safety (Render-stable) ----------
+// IA11 requires Node 18+ (global fetch available). This avoids node-fetch ESM/CJS issues on Render.
+const _fetch = global.fetch;
+
+if (typeof _fetch !== "function") {
+  console.error(
+    "[IA11] Fatal: global fetch is missing. Set Render to Node 18+ (or 20+)."
+  );
+  process.exit(1);
 }
+
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -186,7 +188,22 @@ app.use(
   })
 );
 
-app.options("*", cors());
+// Express 5+ can choke on "*" routes; "/*" is the safe equivalent.
+app.options(
+  "/*",
+  cors({
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true);
+      if (originAllowed(origin)) return cb(null, true);
+      return cb(null, false);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "x-ia11-key"],
+    maxAge: 86400,
+  })
+);
+
+
 
 // =====================
 // Security middleware

@@ -275,7 +275,7 @@ function cacheSet(key, val) {
 // =====================
 // Serper web search
 // =====================
-async function serperSearch(query, uiLanguage) {
+async function serperSearch(query, uiLanguage, opts = {}) {
   if (!SERPER_API_KEY) return { ok: false, items: [], error: "Missing SERPER_API_KEY" };
   if (!_fetch) return { ok: false, items: [], error: "Missing fetch runtime (node-fetch not installed)" };
 
@@ -283,9 +283,13 @@ async function serperSearch(query, uiLanguage) {
   const hl = lang === "en" ? "en" : "fr";
   const gl = SERPER_GL;
 
+  const noCache = !!opts.noCache || String(process.env.SERPER_DISABLE_CACHE || "").toLowerCase() === "true";
+
   const cacheKey = `serper:${hl}:${gl}:${query}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return { ok: true, items: cached, error: null, cached: true };
+  if (!noCache) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return { ok: true, items: cached, error: null, cached: true };
+  }
 
   const r = await _fetch("https://google.serper.dev/search", {
     method: "POST",
@@ -295,6 +299,27 @@ async function serperSearch(query, uiLanguage) {
     },
     body: JSON.stringify({ q: query, num: SERPER_NUM, gl, hl }),
   });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    return { ok: false, items: [], error: `Serper error ${r.status}: ${txt.slice(0, 200)}` };
+  }
+
+  const json = await r.json();
+  const organic = Array.isArray(json?.organic) ? json.organic : [];
+
+  const items = organic
+    .map((x) => ({
+      title: safeStr(x?.title, 200),
+      url: safeStr(x?.link, 600),
+      snippet: safeStr(x?.snippet, 500),
+    }))
+    .filter((x) => x.url && x.title);
+
+  if (!noCache) cacheSet(cacheKey, items);
+  return { ok: true, items, error: null, cached: false };
+}
+
 
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
@@ -376,19 +401,23 @@ function buildQueries(text, mode, lang) {
   return [q1, q2].map((x) => cleanForQuery(x)).filter(Boolean);
 }
 
-async function serperMultiSearch(text, mode, uiLanguage) {
+async function serperMultiSearch(text, mode, uiLanguage, opts = {}) {
   const lang = detectUiLanguage(uiLanguage);
   const queries = buildQueries(text, mode, lang);
+
+  const forceFresh = !!opts.forceFresh;
 
   let all = [];
   let okCount = 0;
   let lastError = null;
+  let cachedUsed = false;
 
   for (const q of queries) {
     try {
-      const out = await serperSearch(q, lang);
+      const out = await serperSearch(q, lang, { noCache: forceFresh });
       if (out.ok) {
         okCount += 1;
+        if (out.cached) cachedUsed = true;
         all = all.concat(out.items || []);
       } else {
         lastError = out.error || lastError;
@@ -397,6 +426,16 @@ async function serperMultiSearch(text, mode, uiLanguage) {
       lastError = e?.message || lastError || "Unknown search error";
     }
   }
+
+  return {
+    ok: okCount > 0,
+    items: all,
+    error: okCount > 0 ? null : lastError || "Unknown search error",
+    queries,
+    cachedUsed,
+  };
+}
+
 
   return {
     ok: okCount > 0,
@@ -721,10 +760,15 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
   let searchOk = false;
   let searchError = null;
   let queriesUsed = [];
+  let cachedUsed = false;
+  let forceFresh = false;
+
 
   try {
-    const out = await serperMultiSearch(text, mode, lang);
-    searchOk = out.ok;
+    forceFresh = mode === "pro" && looksTimeSensitive(text);
+const out = await serperMultiSearch(text, mode, lang, { forceFresh });
+cachedUsed = !!out.cachedUsed;
+
     rawSources = out.items || [];
     searchError = out.error || null;
     queriesUsed = out.queries || [];
@@ -792,14 +836,14 @@ app.post("/v1/analyze", requireKey, rateLimit, async (req, res) => {
         contradictionStrength: contradiction.strength || 0,
       },
     },
-    meta: {
-      tookMs,
-      version: VERSION,
-      webSearchUsed: searchOk && sources.length > 0,
-      bypassEnabled: ALLOW_FRONTEND_BYPASS,
-    },
-  });
-});
+   meta: {
+  tookMs,
+  version: VERSION,
+  webSearchUsed: searchOk && sources.length > 0,
+  webSearchCachedUsed: cachedUsed,
+  webSearchForceFresh: forceFresh,
+  bypassEnabled: ALLOW_FRONTEND_BYPASS,
+},
 
 // =====================
 // Start

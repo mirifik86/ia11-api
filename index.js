@@ -38,6 +38,55 @@ if (typeof _fetch !== "function") {
 // ENV
 const IA11_KEY = process.env.IA11_API_KEY;
 const SERPER_KEY = process.env.SERPER_API_KEY;
+// ENV
+const IA11_KEY = process.env.IA11_API_KEY;
+const SERPER_KEY = process.env.SERPER_API_KEY;
+
+// =====================
+// RATE LIMIT (RAM) — simple & efficace
+// =====================
+const RATE_LIMIT_STANDARD = Number.parseInt(process.env.RATE_LIMIT_PER_MIN || "10", 10);
+
+const RATE_LIMIT_PRO = Number.parseInt(
+  process.env.RATE_LIMIT_PER_MIN_PRO ||
+    process.env.RATE_LIMIT_PER_MIN_P ||
+    process.env.RATE_LIMIT_PRO_PER_MIN ||
+    "30",
+  10
+);
+
+const RATE_STORE = new Map(); // key -> { windowStart, count }
+const RATE_WINDOW_MS = 60 * 1000;
+
+function getClientIp(req) {
+  const xf = req.headers["x-forwarded-for"];
+  if (typeof xf === "string" && xf.length > 0) return xf.split(",")[0].trim();
+  return req.ip || req.connection?.remoteAddress || "unknown";
+}
+
+function rateLimitCheck(req, tier, limitPerMin) {
+  if (!Number.isFinite(limitPerMin) || limitPerMin <= 0) return { ok: true };
+
+  const ip = getClientIp(req);
+  const key = `${tier}:${ip}`;
+  const now = Date.now();
+
+  const cur = RATE_STORE.get(key);
+  if (!cur || now - cur.windowStart >= RATE_WINDOW_MS) {
+    RATE_STORE.set(key, { windowStart: now, count: 1 });
+    return { ok: true };
+  }
+
+  cur.count += 1;
+
+  if (cur.count > limitPerMin) {
+    const msLeft = RATE_WINDOW_MS - (now - cur.windowStart);
+    const retryAfterSec = Math.max(1, Math.ceil(msLeft / 1000));
+    return { ok: false, retryAfterSec };
+  }
+
+  return { ok: true };
+}
 
 // HEALTH
 app.get("/", (req, res) => {

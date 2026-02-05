@@ -420,7 +420,7 @@ function buildProSimilarityProfile(text, lang) {
   }
 
   // Sujet (garde-fou): top 4 tokens triés
-  const topicKey = Array.from(tokens).sort().slice(0, 4).join("|");
+  const topicKey = Array.from(tokens).sort().slice(0, 2).join("|");
 
   return { tokens, topicKey };
 }

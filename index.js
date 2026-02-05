@@ -469,8 +469,8 @@ function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
   if (!best) return { hit: false };
 
   // Seuils (ajustables)
-  const HIGH = 0.82; // réutiliser sans Serper
-  const MID = 0.68;  // borderline -> mini Serper
+  const HIGH = 0.74; // réutiliser sans Serper
+  const MID = 0.60;  // borderline -> mini Serper
 
   if (best.score >= HIGH) {
     return { hit: true, tier: "similar", payload: best.payload, matchedKey: best.key, score: best.score };

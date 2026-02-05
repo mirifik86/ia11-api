@@ -307,6 +307,12 @@ function computeStandard(text, lang) {
 // ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
 
 // Mini cache mémoire (évite de payer Serper 20 fois pour la même intention)
+// SAFE SWITCH:
+// - off   => cache exact seulement (comme avant)
+// - on    => Option C (sens + garde-fous + mini-Serper si borderline)
+// - debug => Option C + logs clairs
+const SIM_CACHE_MODE = (process.env.SIM_CACHE_MODE || process.env.IA11_CACHE_MODE || "on").toLowerCase();
+
 // Niveau 1: cache exact (clé normalisée)
 // Niveau 2: cache "similarité" (même sens + garde-fous)
 const PRO_CACHE = new Map(); // key -> { expiresAt, payload, profile, createdAt }
@@ -439,6 +445,7 @@ function jaccardSimilarity(aSet, bSet) {
 }
 
 // Option C: sens + garde-fous + mini-Serper si borderline
+// Option C: sens + garde-fous + mini-Serper si borderline
 function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
   purgeExpiredProCache();
 
@@ -447,6 +454,9 @@ function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
   if (exactPayload) {
     return { hit: true, tier: "exact", payload: exactPayload, matchedKey: exactKey, score: 1 };
   }
+
+  // SAFE: mode OFF => on ne fait PAS de similarité
+  if (SIM_CACHE_MODE === "off") return { hit: false };
 
   // 2) similarité
   let best = null;
@@ -468,7 +478,7 @@ function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
 
   if (!best) return { hit: false };
 
-  // Seuils (ajustables)
+  // Seuils (FR-friendly)
   const HIGH = 0.74; // réutiliser sans Serper
   const MID = 0.60;  // borderline -> mini Serper
 
@@ -672,11 +682,21 @@ async function runProEvidence(text, lang) {
   // 1) lookup cache (exact -> similar -> borderline)
   const hit = proCacheLookupBySimilarity(claim, lang, cacheKey, profile);
 
+  // DEBUG: voir ce que IA11 “pense”
+  if (SIM_CACHE_MODE === "debug") {
+    console.log("🧠 SIM_CACHE_MODE:", SIM_CACHE_MODE, "topicKey:", profile.topicKey, "tokens:", Array.from(profile.tokens).slice(0, 12));
+    console.log("🧠 CACHE LOOKUP:", hit);
+  }
+
   // HIT exact / similar: 0$ Serper
   if (hit && hit.hit && (hit.tier === "exact" || hit.tier === "similar")) {
     // Bonus: alias la nouvelle formulation vers le même payload
     if (hit.tier === "similar") {
       cacheSet(cacheKey, hit.payload, profile);
+    }
+
+    if (SIM_CACHE_MODE === "debug") {
+      console.log("🧠 CACHE HIT:", { tier: hit.tier, score: hit.score, matchedKey: hit.matchedKey });
     }
 
     return {
@@ -695,9 +715,13 @@ async function runProEvidence(text, lang) {
   let okCount = 0;
   let lastError = null;
 
-  // Option C: si borderline, 1 seule requête + "num" réduit
-  const maxQueries = isBorderline ? 1 : 3;
-  const numPerQuery = isBorderline ? 3 : 5;
+  // SAFE: si OFF, on force le comportement “normal” (3 requêtes / 5 résultats)
+  const maxQueries = (SIM_CACHE_MODE === "off") ? 3 : (isBorderline ? 1 : 3);
+  const numPerQuery = (SIM_CACHE_MODE === "off") ? 5 : (isBorderline ? 3 : 5);
+
+  if (SIM_CACHE_MODE === "debug") {
+    console.log("🧠 SERPER PLAN:", { isBorderline, maxQueries, numPerQuery, queriesPreview: queries.slice(0, 3) });
+  }
 
   for (let i = 0; i < Math.min(maxQueries, queries.length); i++) {
     const q = queries[i];
@@ -716,7 +740,7 @@ async function runProEvidence(text, lang) {
 
     // Stop early: si on a déjà 8 items dédupliqués, c’est suffisant pour un verdict pro
     const fastDedup = dedupeItems(allItems);
-    if (!isBorderline && fastDedup.length >= 8) break;
+    if (SIM_CACHE_MODE !== "off" && !isBorderline && fastDedup.length >= 8) break;
   }
 
   const deduped = dedupeItems(allItems).slice(0, 10);
@@ -760,7 +784,7 @@ async function runProEvidence(text, lang) {
   };
 
   // Si borderline et Serper n'a rien donné: fallback prudent sur le cache similaire
-  if (isBorderline && okCount === 0 && hit && hit.payload) {
+  if (SIM_CACHE_MODE !== "off" && isBorderline && okCount === 0 && hit && hit.payload) {
     const fallback = {
       ...hit.payload,
       ok: hit.payload.ok || false,
@@ -772,14 +796,26 @@ async function runProEvidence(text, lang) {
     };
 
     cacheSet(cacheKey, fallback, profile);
+
+    if (SIM_CACHE_MODE === "debug") {
+      console.log("🧠 BORDERLINE FALLBACK USED");
+    }
+
     return { ...fallback, fromCache: true };
   }
 
   cacheSet(cacheKey, payload, profile);
+
+  if (SIM_CACHE_MODE === "debug") {
+    console.log("🧠 CACHE STORE:", { cacheKey, topicKey: profile.topicKey, okCount, isBorderline });
+  }
+
   return {
     ...payload,
     fromCache: false,
-    cacheHit: isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null
+    cacheHit: (SIM_CACHE_MODE === "off")
+      ? null
+      : (isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null)
   };
 }
 

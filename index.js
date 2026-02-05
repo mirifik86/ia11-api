@@ -402,7 +402,9 @@ function normalizeClaimForCache(text, lang) {
 function buildProSimilarityProfile(text, lang) {
   const l = (lang || "en").toLowerCase();
   const fr = l.startsWith("fr");
-  const stop = fr ? STOP_FR : STOP_EN;
+  // Stopwords combinés + mots génériques fréquents qui polluent la similarité
+const stop = new Set([...STOP_FR, ...STOP_EN, "est", "des", "plus", "situe", "situé", "situer", "america", "amerique", "amérique"]);
+
 
   const cleaned = safeLower(text || "")
     .normalize("NFKD")
@@ -426,7 +428,14 @@ function buildProSimilarityProfile(text, lang) {
   }
 
   // Sujet (garde-fou): top 4 tokens triés
-  const topicKey = Array.from(tokens).sort().slice(0, 2).join("|");
+  // TopicKey "ancré" pour stabiliser les reformulations (Canada / USA)
+const anchors = ["canada", "usa", "etats", "unis", "états", "united", "states"];
+const anchorHits = anchors.filter(a => tokens.has(a));
+
+const topicKey = (anchorHits.length >= 2)
+  ? anchorHits.slice(0, 2).sort().join("|")
+  : Array.from(tokens).sort().slice(0, 2).join("|");
+
 
   return { tokens, topicKey };
 }

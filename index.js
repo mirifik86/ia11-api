@@ -6,6 +6,8 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "1mb" }));
 
 function originAllowed(origin) {
@@ -35,9 +37,6 @@ if (typeof _fetch !== "function") {
   process.exit(1);
 }
 
-// ENV
-const IA11_KEY = process.env.IA11_API_KEY;
-const SERPER_KEY = process.env.SERPER_API_KEY;
 // ENV
 const IA11_KEY = process.env.IA11_API_KEY;
 const SERPER_KEY = process.env.SERPER_API_KEY;
@@ -881,20 +880,6 @@ const claim = extractMainClaim(text);
       : (isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null)
   };
 }
-// RATE LIMIT (Standard vs Pro)
-const limit = normalizedMode === "pro" ? RATE_LIMIT_PRO : RATE_LIMIT_STANDARD;
-const rl = rateLimitCheck(req, normalizedMode, limit);
-
-if (!rl.ok) {
-  res.set("Retry-After", String(rl.retryAfterSec));
-  return res.status(429).json({
-    error: "Rate limit exceeded",
-    mode: normalizedMode,
-    limitPerMin: limit,
-    retryAfterSec: rl.retryAfterSec,
-  });
-}
-
 
 function computeProFinalScore(text, lang, writingScore, evidenceScore, strongRefute, verifiable) {
   // Score PRO = 80% preuve + 20% écriture (ultra logique)
@@ -943,6 +928,19 @@ app.post("/v1/analyze", async (req, res) => {
     if (!text) return res.status(400).json({ error: "Text required" });
 
     const normalizedMode = safeLower(mode) === "pro" ? "pro" : "standard";
+    // RATE LIMIT (Standard vs Pro)
+    const limit = normalizedMode === "pro" ? RATE_LIMIT_PRO : RATE_LIMIT_STANDARD;
+    const rl = rateLimitCheck(req, normalizedMode, limit);
+      
+      if (!rl.ok) {
+        res.set("Retry-After", String(rl.retryAfterSec));
+        return res.status(429).json({
+          error: "Rate limit exceeded",
+          mode: normalizedMode,
+          limitPerMin: limit,
+          retryAfterSec: rl.retryAfterSec,
+        });
+      }
 
     // STANDARD: 0 Serper
     if (normalizedMode === "standard") {

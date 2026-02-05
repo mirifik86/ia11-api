@@ -673,11 +673,16 @@ function buildProExplanation(lang, claim, evidence, buckets) {
 }
 
 async function runProEvidence(text, lang) {
-  const claim = extractMainClaim(text);
+ // 🔑 Similarité basée sur le texte utilisateur complet (pas sur le claim)
+const rawTextForCache = (text || "").slice(0, 500);
 
-  // Profil pour "même sens" (Option C)
-  const cacheKey = normalizeClaimForCache(claim, lang);
-  const profile = buildProSimilarityProfile(claim, lang);
+// Cache & similarité AVANT extraction du claim
+const cacheKey = normalizeClaimForCache(rawTextForCache, lang);
+const profile = buildProSimilarityProfile(rawTextForCache, lang);
+
+// Le claim reste utilisé pour l’analyse finale
+const claim = extractMainClaim(text);
+
 
   // 1) lookup cache (exact -> similar -> borderline)
   const hit = proCacheLookupBySimilarity(claim, lang, cacheKey, profile);

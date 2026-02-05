@@ -45,8 +45,8 @@ app.get("/", (req, res) => {
 });
 
 // ================= SERPER SEARCH =================
-async function serperSearch(query, lang) {
-  console.log("🔎 SERPER QUERY:", query);   // <-- AJOUT
+async function serperSearch(query, lang, num = 5) {
+  console.log("🔎 SERPER QUERY:", query);
 
   try {
     const r = await _fetch("https://google.serper.dev/search", {
@@ -55,19 +55,21 @@ async function serperSearch(query, lang) {
         "X-API-KEY": SERPER_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ q: query, gl: "us", hl: lang || "en" }),
+      // "num" est optionnel: si Serper le supporte, ça réduit volume/cout.
+      body: JSON.stringify({ q: query, gl: "us", hl: lang || "en", num }),
     });
 
     const j = await r.json();
 
-    console.log("📥 SERPER RESULTS:", (j.organic || []).length); // <-- AJOUT
+    console.log("📥 SERPER RESULTS:", (j.organic || []).length);
 
-    return { ok: true, items: (j.organic || []).slice(0, 5) };
+    return { ok: true, items: (j.organic || []).slice(0, Math.max(1, num)) };
   } catch (e) {
-    console.log("❌ SERPER ERROR:", e.message); // <-- AJOUT
+    console.log("❌ SERPER ERROR:", e.message);
     return { ok: false, error: e.message };
   }
 }
+
 
 
 // ================= IA11 PRO CORE (Brutal Standard + WOW PRO) =================
@@ -304,10 +306,59 @@ function computeStandard(text, lang) {
 
 // ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
 
-// Mini cache mémoire (évite de payer Serper 20 fois pour la même phrase)
-const PRO_CACHE = new Map(); // key -> { expiresAt, payload }
+// Mini cache mémoire (évite de payer Serper 20 fois pour la même intention)
+// Niveau 1: cache exact (clé normalisée)
+// Niveau 2: cache "similarité" (même sens + garde-fous)
+const PRO_CACHE = new Map(); // key -> { expiresAt, payload, profile, createdAt }
 const PRO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// Pour éviter de scanner un cache infini (RAM), on limite les comparaisons
+const PRO_CACHE_MAX_SCAN = 1500;
+
+// Stopwords simples (FR/EN) pour extraire le "sujet"
+const STOP_FR = new Set([
+  "le","la","les","un","une","des","du","de","d","au","aux","a","à","en","dans","sur","sous","chez",
+  "et","ou","mais","donc","or","ni","car","que","qui","quoi","dont","où",
+  "est","sont","été","etre","être","avait","ont","avoir",
+  "ce","cet","cette","ces","cela","ça","se","sa","son","ses","leur","leurs","mon","ma","mes","ton","ta","tes","nos","vos",
+  "plus","moins","tres","très","pas","ne","non","oui",
+  "il","elle","ils","elles","on","nous","vous","tu","je","j",
+  "aujourd","hui","hier","demain"
+]);
+
+const STOP_EN = new Set([
+  "the","a","an","and","or","but","so","because","of","to","in","on","at","by","for","with","from","as",
+  "is","are","was","were","be","been","being","have","has","had",
+  "this","that","these","those","it","its","they","them","we","you","i",
+  "not","no","yes","very","more","less","than"
+]);
+
+// Mini table de synonymes (juste pour capturer les cas fréquents, pas pour être parfait)
+function synonymMapToken(tok, lang) {
+  const t = tok;
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  if (fr) {
+    if (t === "au-dessus" || t === "dessus") return "nord";
+    if (t === "nord" || t === "nordest" || t === "nord-ouest") return "nord";
+    if (t === "etats" || t === "etat" || t === "unis" || t === "américains" || t === "americains") return "usa";
+    if (t === "états" || t === "état") return "usa";
+    if (t === "amérique" || t === "amerique") return "amerique";
+  } else {
+    if (t === "above" || t === "over") return "north";
+    if (t === "north" || t === "northern") return "north";
+    if (t === "united" || t === "states" || t === "america" || t === "american") return "usa";
+  }
+  return t;
+}
+
+function purgeExpiredProCache() {
+  const now = Date.now();
+  for (const [k, v] of PRO_CACHE.entries()) {
+    if (!v || now > v.expiresAt) PRO_CACHE.delete(k);
+  }
+}
 
 function cacheGet(key) {
   const v = PRO_CACHE.get(key);
@@ -319,17 +370,117 @@ function cacheGet(key) {
   return v.payload;
 }
 
-function cacheSet(key, payload) {
-  PRO_CACHE.set(key, { expiresAt: Date.now() + PRO_CACHE_TTL_MS, payload });
+// profile optionnel: { tokens:Set<string>, topicKey:string }
+function cacheSet(key, payload, profile) {
+  PRO_CACHE.set(key, {
+    expiresAt: Date.now() + PRO_CACHE_TTL_MS,
+    createdAt: Date.now(),
+    payload,
+    profile: profile || null,
+  });
 }
 
 function normalizeClaimForCache(text, lang) {
+  // Niveau 1 (exact): clé stable, robuste aux ponctuations/espaces
   const t = safeLower(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // enlève accents
     .replace(/\s+/g, " ")
     .replace(/[^\p{L}\p{N}\s]/gu, "")
     .trim()
     .slice(0, 220);
+
   return `${(lang || "en").toLowerCase()}::${t}`;
+}
+
+function buildProSimilarityProfile(text, lang) {
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+  const stop = fr ? STOP_FR : STOP_EN;
+
+  const cleaned = safeLower(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 260);
+
+  const rawTokens = cleaned.split(" ").filter(Boolean);
+
+  const tokens = new Set();
+  for (let tok of rawTokens) {
+    if (!tok) continue;
+    if (tok.length <= 2) continue;
+    if (stop.has(tok)) continue;
+    tok = synonymMapToken(tok, lang);
+    if (!tok || tok.length <= 2) continue;
+    if (stop.has(tok)) continue;
+    tokens.add(tok);
+  }
+
+  // Sujet (garde-fou): top 4 tokens triés
+  const topicKey = Array.from(tokens).sort().slice(0, 4).join("|");
+
+  return { tokens, topicKey };
+}
+
+function jaccardSimilarity(aSet, bSet) {
+  if (!aSet || !bSet) return 0;
+  const a = aSet.size;
+  const b = bSet.size;
+  if (a === 0 || b === 0) return 0;
+
+  let inter = 0;
+  for (const x of aSet) if (bSet.has(x)) inter++;
+
+  const union = a + b - inter;
+  return union <= 0 ? 0 : inter / union;
+}
+
+// Option C: sens + garde-fous + mini-Serper si borderline
+function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
+  purgeExpiredProCache();
+
+  // 1) exact cache
+  const exactPayload = cacheGet(exactKey);
+  if (exactPayload) {
+    return { hit: true, tier: "exact", payload: exactPayload, matchedKey: exactKey, score: 1 };
+  }
+
+  // 2) similarité
+  let best = null;
+  let scanned = 0;
+
+  for (const [k, entry] of PRO_CACHE.entries()) {
+    if (!entry || !entry.payload) continue;
+    if (!entry.profile || !entry.profile.tokens) continue;
+
+    scanned++;
+    if (scanned > PRO_CACHE_MAX_SCAN) break;
+
+    // Garde-fou sujet: topicKey identique (évite les faux matchs)
+    if (profile.topicKey && entry.profile.topicKey && profile.topicKey !== entry.profile.topicKey) continue;
+
+    const sim = jaccardSimilarity(profile.tokens, entry.profile.tokens);
+    if (!best || sim > best.score) best = { key: k, score: sim, payload: entry.payload };
+  }
+
+  if (!best) return { hit: false };
+
+  // Seuils (ajustables)
+  const HIGH = 0.82; // réutiliser sans Serper
+  const MID = 0.68;  // borderline -> mini Serper
+
+  if (best.score >= HIGH) {
+    return { hit: true, tier: "similar", payload: best.payload, matchedKey: best.key, score: best.score };
+  }
+
+  if (best.score >= MID) {
+    return { hit: true, tier: "borderline", payload: best.payload, matchedKey: best.key, score: best.score };
+  }
+
+  return { hit: false };
 }
 
 function extractMainClaim(text) {
@@ -513,9 +664,30 @@ function buildProExplanation(lang, claim, evidence, buckets) {
 
 async function runProEvidence(text, lang) {
   const claim = extractMainClaim(text);
+
+  // Profil pour "même sens" (Option C)
   const cacheKey = normalizeClaimForCache(claim, lang);
-  const cached = cacheGet(cacheKey);
-  if (cached) return { ...cached, fromCache: true };
+  const profile = buildProSimilarityProfile(claim, lang);
+
+  // 1) lookup cache (exact -> similar -> borderline)
+  const hit = proCacheLookupBySimilarity(claim, lang, cacheKey, profile);
+
+  // HIT exact / similar: 0$ Serper
+  if (hit && hit.hit && (hit.tier === "exact" || hit.tier === "similar")) {
+    // Bonus: alias la nouvelle formulation vers le même payload
+    if (hit.tier === "similar") {
+      cacheSet(cacheKey, hit.payload, profile);
+    }
+
+    return {
+      ...hit.payload,
+      fromCache: true,
+      cacheHit: { tier: hit.tier, score: hit.score, matchedKey: hit.matchedKey },
+    };
+  }
+
+  // HIT borderline: mini-Serper (moins de résultats) pour sécuriser la crédibilité
+  const isBorderline = !!(hit && hit.hit && hit.tier === "borderline");
 
   const queries = buildProQueries(claim, lang);
 
@@ -523,10 +695,15 @@ async function runProEvidence(text, lang) {
   let okCount = 0;
   let lastError = null;
 
-  // Max 3 requêtes, et on s’arrête tôt si on a déjà assez de matière
-  for (const q of queries) {
+  // Option C: si borderline, 1 seule requête + "num" réduit
+  const maxQueries = isBorderline ? 1 : 3;
+  const numPerQuery = isBorderline ? 3 : 5;
+
+  for (let i = 0; i < Math.min(maxQueries, queries.length); i++) {
+    const q = queries[i];
+
     try {
-      const out = await serperSearch(q, lang);
+      const out = await serperSearch(q, lang, numPerQuery);
       if (out.ok) {
         okCount++;
         allItems = allItems.concat(out.items || []);
@@ -539,7 +716,7 @@ async function runProEvidence(text, lang) {
 
     // Stop early: si on a déjà 8 items dédupliqués, c’est suffisant pour un verdict pro
     const fastDedup = dedupeItems(allItems);
-    if (fastDedup.length >= 8) break;
+    if (!isBorderline && fastDedup.length >= 8) break;
   }
 
   const deduped = dedupeItems(allItems).slice(0, 10);
@@ -582,9 +759,30 @@ async function runProEvidence(text, lang) {
     error: okCount > 0 ? null : lastError || "Unknown search error",
   };
 
-  cacheSet(cacheKey, payload);
-  return { ...payload, fromCache: false };
+  // Si borderline et Serper n'a rien donné: fallback prudent sur le cache similaire
+  if (isBorderline && okCount === 0 && hit && hit.payload) {
+    const fallback = {
+      ...hit.payload,
+      ok: hit.payload.ok || false,
+      fromCache: true,
+      cacheHit: { tier: "borderline-fallback", score: hit.score, matchedKey: hit.matchedKey },
+      note: (lang || "en").toLowerCase().startsWith("fr")
+        ? "Mini-recherche web indisponible; réutilisation prudente d’un résultat similaire en cache."
+        : "Mini web search unavailable; cautiously reusing a similar cached result.",
+    };
+
+    cacheSet(cacheKey, fallback, profile);
+    return { ...fallback, fromCache: true };
+  }
+
+  cacheSet(cacheKey, payload, profile);
+  return {
+    ...payload,
+    fromCache: false,
+    cacheHit: isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null
+  };
 }
+
 
 function computeProFinalScore(text, lang, writingScore, evidenceScore, strongRefute, verifiable) {
   // Score PRO = 80% preuve + 20% écriture (ultra logique)

@@ -29,6 +29,10 @@ app.use(
 );
 
 app.options("/*", cors());
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path} origin=${req.headers.origin || "none"}`);
+  next();
+});
 
 // FETCH SAFE
 const _fetch = global.fetch;

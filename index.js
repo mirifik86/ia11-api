@@ -1161,7 +1161,9 @@ async function runProEvidence(text, lang) {
     else buckets.neutral.push(it);
   }
 
-   const evidence = scoreEvidenceBrutal(enriched, verifiable);
+   const verifiable = looksLikeVerifiableClaim(claim || text);
+    const evidence = scoreEvidenceBrutal(enriched, verifiable);
+    
 
 
   const payload = {

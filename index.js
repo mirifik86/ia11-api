@@ -118,16 +118,14 @@ async function serperSearch(query, lang, num = 5) {
 
     return { ok: true, items: (j.organic || []).slice(0, Math.max(1, num)) };
   } catch (e) {
-    const msg = e?.name === "AbortError" ? `timeout after ${HTTP_TIMEOUT_MS}ms` : (e?.message || "unknown error");
+    const msg =
+      e?.name === "AbortError" ? `timeout after ${HTTP_TIMEOUT_MS}ms` : (e?.message || "unknown error");
     console.log("❌ SERPER ERROR:", msg);
     return { ok: false, error: msg };
   } finally {
     clearTimeout(timer);
   }
 }
-
-
-
 
 // ================= IA11 PRO CORE (Brutal Standard + WOW PRO) =================
 
@@ -146,1405 +144,985 @@ function normalizeUrl(u) {
   }
 }
 
-function getDomain(u) {
+function domainOf(u) {
   try {
-    return new URL(u).hostname.replace(/^www\./, "");
+    const url = new URL(u);
+    return (url.hostname || "").replace(/^www\./, "");
   } catch {
     return "";
   }
 }
 
-// Petit classement simple (évite de donner le même poids à un blog random qu’à un site officiel)
-function domainReliability(domain) {
-  const d = safeLower(domain);
-
-  // Très forts (officiels / institutions)
-  if (d.endsWith(".gov") || d.endsWith(".gouv.fr") || d.endsWith(".gc.ca")) return 100;
-  if (d.endsWith(".edu")) return 92;
-
-  // Forts (médias reconnus / encyclopédies)
-  const strong = [
-    "reuters.com",
-    "apnews.com",
-    "bbc.co.uk",
-    "bbc.com",
-    "theguardian.com",
-    "nytimes.com",
-    "washingtonpost.com",
-    "cnn.com",
-    "cnbc.com",
-    "ft.com",
-    "wsj.com",
-    "economist.com",
-    "npr.org",
-    "cbc.ca",
-    "radio-canada.ca",
-    "canada.ca",
-    "who.int",
-    "un.org",
-    "europa.eu",
-    "wikipedia.org",
-    "britannica.com",
-  ];
-  if (strong.includes(d)) return 85;
-
-  // OK (sites “normaux”)
-  if (d) return 65;
-
-  // Inconnu
-  return 50;
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
 }
 
-function dedupeItems(items) {
-  const seen = new Set();
-  const out = [];
-  for (const it of items || []) {
-    const link = normalizeUrl(it.link || it.url || "");
-    if (!link) continue;
-    if (seen.has(link)) continue;
-    seen.add(link);
-    out.push(it);
+function stripSpaces(s) {
+  return (s || "").toString().replace(/\s+/g, " ").trim();
+}
+
+function normalizeQuery(q) {
+  return stripSpaces(safeLower(q))
+    .replace(/[’'"]/g, "")
+    .replace(/[^a-z0-9\s\u00C0-\u017F]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenize(s) {
+  const t = normalizeQuery(s).split(" ").filter(Boolean);
+  return t.length ? t : [];
+}
+
+function jaccard(aTokens, bTokens) {
+  const A = new Set(aTokens);
+  const B = new Set(bTokens);
+  if (A.size === 0 && B.size === 0) return 1;
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  const union = A.size + B.size - inter;
+  return union === 0 ? 0 : inter / union;
+}
+
+function levenshtein(a, b) {
+  a = a || "";
+  b = b || "";
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
   }
-  return out;
+  return dp[m][n];
 }
 
-// ---------------- STANDARD (0 Serper) : brutal, intelligent, honnête ----------------
+function similarityScore(q1, q2) {
+  const n1 = normalizeQuery(q1);
+  const n2 = normalizeQuery(q2);
 
-function hasUserProvidedSources(text) {
-  const t = safeLower(text);
-  return (
-    t.includes("http://") ||
-    t.includes("https://") ||
-    t.includes("www.") ||
-    t.includes("source:") ||
-    t.includes("sources:") ||
-    t.includes("selon ") ||
-    t.includes("according to ")
-  );
+  if (!n1 || !n2) return 0;
+
+  if (n1 === n2) return 1;
+
+  const t1 = tokenize(n1);
+  const t2 = tokenize(n2);
+
+  const jac = jaccard(t1, t2);
+
+  const maxLen = Math.max(n1.length, n2.length);
+  const lev = levenshtein(n1, n2);
+  const levSim = maxLen === 0 ? 0 : 1 - lev / maxLen;
+
+  // Weighted blend
+  const sim = 0.65 * jac + 0.35 * levSim;
+
+  return clamp(sim, 0, 1);
 }
 
-  function looksLikeVerifiableClaim(text) {
-  const t = safeLower(text);
-
-  // Indices simples de “fait vérifiable”
-  const hasNumbers = /\d/.test(t);
-  const hasYear = /\b(19\d{2}|20\d{2})\b/.test(t);
-
-  const highRiskKeywords = [
-    // postes / politique
-    "président",
-    "president",
-    "premier ministre",
-    "prime minister",
-    "pape",
-    "pope",
-    "élection",
-    "election",
-    "guerre",
-    "war",
-    "ministre",
-    "minister",
-    "gouvernement",
-    "government",
-    "chef d'état",
-    "head of state",
-    "maire",
-    "mayor",
-    "ceo",
-    "pdg",
-
-    // faits “durs” fréquents
-    "capitale",
-    "capital",
-    "population",
-    "habitants",
-    "gdp",
-    "pib",
-    "superficie",
-    "area",
-    "date",
-    "année",
-    "year",
-  ];
-
-  const verbFact = [
-    "est ",
-    "sont ",
-    "was ",
-    "were ",
-    "is ",
-    "are ",
-    "a été",
-    "ont été",
-    "depuis",
-    "since",
-    "in ",
-  ];
-
-  const kwHit = highRiskKeywords.some((k) => t.includes(k));
-  const verbHit = verbFact.some((v) => t.includes(v));
-
-  // Patterns “capitale / capital of” même sans mots-clés “poste”
-  const capitalPattern =
-    /\bcapitale\b/.test(t) ||
-    /\bcapital\b/.test(t) ||
-    /\bcapital\s+of\b/.test(t) ||
-    /\bcapitale\s+(du|de la|de l'|des)\b/.test(t);
-
-  // Si c’est court + contient structure factuelle → vérifiable
-  if (t.length < 220 && (kwHit || hasNumbers || hasYear || capitalPattern) && verbHit) return true;
-
-  // Même si plus long, si mots “fait dur” + verbes factuels
-  if ((kwHit || capitalPattern) && verbHit) return true;
-
-  return false;
+function shouldTreatAsSameQuery(q1, q2) {
+  // Strict mode = higher threshold
+  const threshold = SIMILARITY_STRICT_MODE ? 0.86 : 0.78;
+  return similarityScore(q1, q2) >= threshold;
 }
 
+// ================= CACHE (RAM) =================
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 jours
+const SERPER_CACHE = new Map(); // key -> { ts, value }
+
+function cacheKeyForSerper(query, lang) {
+  return `${normalizeQuery(query)}::${(lang || "en").toLowerCase()}`;
+}
+
+function getCachedSerper(query, lang) {
+  const key = cacheKeyForSerper(query, lang);
+  const hit = SERPER_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL_MS) {
+    SERPER_CACHE.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function setCachedSerper(query, lang, value) {
+  const key = cacheKeyForSerper(query, lang);
+  SERPER_CACHE.set(key, { ts: Date.now(), value });
+}
+
+// Similar-query cache lookup (to avoid paying Serper on typos/small variations)
+function getCachedSerperSimilar(query, lang) {
+  const langKey = (lang || "en").toLowerCase();
+  const norm = normalizeQuery(query);
+
+  // quick pass
+  for (const [k, entry] of SERPER_CACHE.entries()) {
+    if (Date.now() - entry.ts > CACHE_TTL_MS) {
+      SERPER_CACHE.delete(k);
+      continue;
+    }
+    const [cachedNorm, cachedLang] = k.split("::");
+    if (cachedLang !== langKey) continue;
+
+    if (cachedNorm === norm) return entry.value;
+
+    if (shouldTreatAsSameQuery(cachedNorm, norm)) {
+      return entry.value;
+    }
+  }
+  return null;
+}
+
+// =====================
+// STANDARD CORE (Option B : 70% texte + 30% mini reality-check Serper 1 query)
+// =====================
 
 function computeWritingScore(text) {
-  const t = (text || "").trim();
+  const t = stripSpaces(text);
   if (!t) return 0;
 
-  let score = 70;
+  // Simple heuristics: caps, emojis, exclamation spam, length sanity
+  const len = t.length;
+  const caps = (t.match(/[A-ZÀ-ÖØ-Þ]/g) || []).length;
+  const letters = (t.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/g) || []).length;
+  const capsRatio = letters ? caps / letters : 0;
 
-  const lower = safeLower(t);
-
-  // Pénalités “style manipulation”
   const exclam = (t.match(/!/g) || []).length;
-  const allCapsRatio =
-    t.length > 30 ? (t.replace(/[^A-Z]/g, "").length / t.length) : 0;
+  const qmarks = (t.match(/\?/g) || []).length;
 
-  if (exclam >= 3) score -= 12;
-  if (allCapsRatio > 0.25) score -= 15;
-  if (lower.includes("100%") || lower.includes("certain") || lower.includes("c'est sûr") || lower.includes("proof")) score -= 8;
+  const emojis = (t.match(/[\u{1F300}-\u{1FAFF}]/gu) || []).length;
 
-  // Bonus “prudence”
-  if (lower.includes("il semble") || lower.includes("probablement") || lower.includes("peut-être") || lower.includes("selon") || lower.includes("à ce stade")) score += 6;
+  let score = 75;
 
-  // Pénalité si ultra court
-  if (t.length < 20) score -= 12;
+  // caps penalty
+  if (capsRatio > 0.15) score -= 12;
+  if (capsRatio > 0.3) score -= 20;
 
-  // Clamp
-  score = Math.max(0, Math.min(100, Math.round(score)));
-  return score;
+  // punctuation spam penalty
+  if (exclam >= 3) score -= 8;
+  if (exclam >= 6) score -= 14;
+  if (qmarks >= 4) score -= 6;
+
+  // emoji penalty
+  if (emojis >= 4) score -= 10;
+  if (emojis >= 8) score -= 18;
+
+  // very short text reduces certainty
+  if (len < 50) score -= 10;
+  if (len < 25) score -= 18;
+
+  // very long text: mild penalty (noise)
+  if (len > 1500) score -= 6;
+
+  return clamp(Math.round(score), 0, 100);
 }
 
-function computeStandard(text, lang) {
-  // Option B (optimisée) = 70% qualité du texte + 30% mini reality-check (1 Serper max)
-  const writingScore = computeWritingScore(text);
-
-  const providedSources = hasUserProvidedSources(text);
-  const claims = extractStandardClaims(text, lang, 6);
-  const claimToCheck = pickPriorityClaim(claims, lang);
-
-  // Petit frein “conversion PRO” : si le texte contient des affirmations vérifiables sans sources,
-  // on réduit légèrement le plafond (sans massacrer le score, car le reality-check va trancher sur 1 claim).
-  const verifiableOverall = looksLikeVerifiableClaim(text);
-  let textScore = writingScore;
-
-  let cap = 100;
-  let capReason = null;
-
-  if (verifiableOverall && !providedSources) {
-    cap = 75;
-    capReason = "Verifiable claims detected without any source provided in the text (Standard stays cautious).";
-  } else if (verifiableOverall) {
-    cap = 85;
-    capReason = "Verifiable claims detected with limited/unclear sourcing (Standard stays cautious).";
-  }
-
-  textScore = Math.max(0, Math.min(cap, Math.round(textScore)));
-
-  const l = (lang || "en").toLowerCase();
+function labelFromScore(language, score) {
+  const l = (language || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
-  // Résumé Standard = utile mais volontairement incomplet (tease PRO)
+  if (score >= 80) return fr ? "Très crédible" : "Very credible";
+  if (score >= 65) return fr ? "Crédible" : "Credible";
+  if (score >= 50) return fr ? "Moyen" : "Mixed";
+  if (score >= 35) return fr ? "Douteux" : "Dubious";
+  return fr ? "Très douteux" : "Very dubious";
+}
+
+function computeStandard(text, language) {
+  const writingScore = computeWritingScore(text);
+  const l = (language || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  // score texte de base
+  let textScore = writingScore;
+
+  // cap -> éviter "faux/vrai", rester guide
+  let capApplied = false;
+  let capReason = "";
+
+  // if extreme claims patterns, lower the base
+  const t = safeLower(text);
+  if (/(100%|certain|preuve absolue|impossible|toujours|jamais)/i.test(t)) {
+    capApplied = true;
+    capReason = fr
+      ? "Formulations absolues détectées, prudence augmentée."
+      : "Absolute phrasing detected; increased caution.";
+    textScore = Math.max(35, textScore - 12);
+  }
+
+  const claimToCheck = extractMainClaim(text);
+
   const summary = fr
-    ? "Analyse Standard : cohérence du texte + signaux de crédibilité. Vérification web minimale (1 seul point) pour éviter les absurdités factuelles."
-    : "Standard analysis: text coherence + credibility signals. Minimal web check (single point) to avoid obvious factual nonsense.";
+    ? "Analyse Standard : cohérence du texte + mini vérification web sur un point prioritaire."
+    : "Standard analysis: text coherence + a minimal web check on one key point.";
 
-  const positives = buildStandardPositives(text, lang);
-  const risks = buildStandardRisks(text, lang);
-  const missing = buildStandardMissingInfo(text, lang, providedSources);
-
-  const proTease = fr
-    ? "PRO (2,99$) : plusieurs affirmations vérifiées, preuves/sources, et justification complète."
-    : "PRO ($2.99): multiple claims checked, evidence/sources, and a full justification.";
+  const bullets = {
+    whatWeDid: fr ? "Lecture rapide du style et de la prudence." : "Quick read of style and prudence.",
+    whatWeDid2: fr ? "Mini vérification web (1 requête) sur un claim prioritaire." : "Minimal web check (1 query) on a key claim.",
+    proTease: fr
+      ? "PRO : preuves + sources + explication complète."
+      : "PRO: evidence + sources + full explanation.",
+  };
 
   return {
-    textScore,
     summary,
-    bullets: { positives, risks, missing, proTease },
+    textScore,
+    bullets,
     standard: {
       writingScore,
-      capApplied: cap,
-      capReason: capReason
-        ? (fr
-            ? "Des affirmations vérifiables semblent présentes, mais les sources ne sont pas fournies clairement. Standard reste prudent."
-            : "Verifiable claims seem present, but sources are not clearly provided. Standard stays cautious.")
-        : null,
-      claimsExtracted: claims.slice(0, 6),
-      claimToCheck: claimToCheck || null,
+      capApplied,
+      capReason,
+      claimToCheck,
     },
   };
 }
 
-// ---------------- STANDARD: Claims (3–6) + 1 mini Reality Check ----------------
-
-function extractStandardClaims(text, lang, maxClaims = 6) {
-  const t = (text || "").replace(/\s+/g, " ").trim();
-  if (!t) return [];
-
-  // Découpage très simple (robuste + cheap)
-  const raw = t
-    .split(/(?<=[\.\!\?])\s+|\n+/g)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  // Filtre: on garde les phrases "affirmatives" (verifiables / structurées)
-  const out = [];
-  const seen = new Set();
-
-  for (const s of raw) {
-    if (out.length >= maxClaims * 2) break; // marge avant tri
-
-    const short = s.length > 220 ? s.slice(0, 220) : s;
-    const key = safeLower(short).replace(/[^a-z0-9à-öø-ÿ]+/gi, " ").trim();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-
-    const hasNumber = /\b\d{1,4}\b/.test(short);
-    const hasProper = /\b[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,}\b/.test(short);
-    const hasCopula = /\b(est|sont|était|étaient|is|are|was|were|become|devient|représente)\b/i.test(short);
-    const hasGeo = /\b(ville|city|pays|country|capitale|capital|province|state)\b/i.test(short);
-
-    const keep = hasCopula || hasNumber || (hasProper && hasGeo);
-    if (keep) out.push(short);
-  }
-
-  // Si trop peu, on prend quand même les premières phrases
-  if (out.length < 3) {
-    for (const s of raw) {
-      if (out.length >= 3) break;
-      const short = s.length > 220 ? s.slice(0, 220) : s;
-      if (!out.includes(short)) out.push(short);
-    }
-  }
-
-  // Tri: les plus “vérifiables” en premier
-  const scored = out.map((s) => ({ s, score: scoreClaimVerifiability(s) }));
-  scored.sort((a, b) => b.score - a.score);
-
-  return scored.slice(0, maxClaims).map((x) => x.s);
-}
-
-function scoreClaimVerifiability(sentence) {
-  const s = sentence || "";
-  let score = 0;
-
-  if (/\b\d{1,4}\b/.test(s)) score += 18;
-  if (/\b[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,}\b/.test(s)) score += 12;
-  if (/\b(ville|city|pays|country|capitale|capital|province|state)\b/i.test(s)) score += 14;
-  if (/\b(est|sont|is|are|was|were)\b/i.test(s)) score += 10;
-
-  // Très “simple et vérifiable” => priorité
-  if (/\b(ville|city)\b/i.test(s) && /\b(pays|country)\b/i.test(s)) score += 10;
-
-  // Trop long = moins bon pour une requête Serper
-  if (s.length > 180) score -= 8;
-
-  return score;
-}
-
-function pickPriorityClaim(claims, lang) {
-  if (!Array.isArray(claims) || claims.length === 0) return null;
-
-  // On prend déjà trié par verifiability — mais on pousse les cas “ville/pays” en priorité
-  const boosted = claims
-    .map((c) => ({ c, boost: (/\b(ville|city)\b/i.test(c) && /\b(pays|country)\b/i.test(c)) ? 25 : 0 }))
-    .sort((a, b) => b.boost - a.boost);
-
-  return boosted[0]?.c || claims[0] || null;
-}
-
-async function runStandardRealityCheck(text, lang, claimToCheck) {
-  // Si pas de clé Serper, on ne bloque pas le Standard (fallback sans web).
-  if (!SERPER_KEY) {
-    return { used: false, verdict: "unavailable", realityScore: 55, note: "no_serper_key", checkedClaim: claimToCheck || null };
-  }
-
-  const query = buildStandardRealityQuery(text, lang, claimToCheck);
-  if (!query) return { used: false, verdict: "unavailable", realityScore: 55, note: "no_query", checkedClaim: claimToCheck || null };
-
-  const sr = await serperSearch(query, lang, 5);
-  if (!sr.ok) return { used: false, verdict: "unavailable", realityScore: 55, note: "serper_error", checkedClaim: claimToCheck || null };
-
-  const items = (sr.items || []).slice(0, 5);
-  const evalOut = evaluateStandardReality(claimToCheck || text, items, lang);
-
-  return {
-    used: true,
-    verdict: evalOut.verdict,
-    realityScore: evalOut.realityScore,
-    note: evalOut.note,
-    checkedClaim: claimToCheck || null,
-    query,
-  };
-}
-
-function buildStandardRealityQuery(text, lang, claimToCheck) {
-  const t = (claimToCheck || text || "").replace(/\s+/g, " ").trim();
-  if (!t) return null;
-
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  // Sujet (ex: "Canada" dans "Le Canada est ...")
-  const subject =
-    (t.match(/\b(?:le|la|l')\s*([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,})/i) || [])[1] ||
-    (t.match(/\b([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,})\b/) || [])[1] ||
-    "";
-
-  const mentionsCity = /\b(ville|city)\b/i.test(t);
-  const mentionsCountry = /\b(pays|country)\b/i.test(t);
-
-  // Requête spéciale pour le cas "X est une ville/pays"
-  if (subject && (mentionsCity || mentionsCountry)) {
-    if (mentionsCity) {
-      return fr
-        ? `${subject} est une ville ou un pays`
-        : `${subject} is a city or a country`;
-    }
-    if (mentionsCountry) {
-      return fr
-        ? `${subject} est un pays ou une ville`
-        : `${subject} is a country or a city`;
-    }
-  }
-
-  // Requête “fact check” courte
-  const short = t.length > 140 ? t.slice(0, 140) : t;
-  return fr ? `${short} vérification` : `${short} fact check`;
-}
-
-function evaluateStandardReality(claimText, items, lang) {
-  const t = (claimText || "").toLowerCase();
-
-  const claimCity = /\b(ville|city)\b/.test(t);
-  const claimCountry = /\b(pays|country)\b/.test(t);
-
-  // Titre + snippet des 3 premiers résultats
-  const top = (items || []).slice(0, 3).map((it) => `${it.title || ""} ${it.snippet || ""}`.toLowerCase()).join(" ");
-
-  const evidenceCity = /\b(ville|city|municipality|town)\b/.test(top);
-  const evidenceCountry = /\b(pays|country|sovereign|nation)\b/.test(top);
-
-  // Contradiction évidente => realityScore très bas (objectif : score final ~10–15 si le texte se trompe gros)
-  if (claimCity && evidenceCountry && !evidenceCity) {
-    return {
-      verdict: "contradiction",
-      realityScore: 5,
-      note: "Claim suggests CITY; top results describe COUNTRY.",
-    };
-  }
-
-  if (claimCountry && evidenceCity && !evidenceCountry) {
-    return {
-      verdict: "contradiction",
-      realityScore: 5,
-      note: "Claim suggests COUNTRY; top results describe CITY.",
-    };
-  }
-
-  // Si c’est vérifiable, mais pas de contradiction claire => moyen (on reste prudent)
-  const verifiable = looksLikeVerifiableClaim(claimText);
-  if (verifiable) {
-    return { verdict: "uncertain", realityScore: 45, note: "Verifiable claim: no obvious contradiction, but not fully proven in Standard." };
-  }
-
-  // Sinon: rien à checker => plutôt neutre
-  return { verdict: "none", realityScore: 70, note: "No obvious contradiction detected." };
-}
-
-// ----------- Small helpers for Standard bullets (teasing PRO) -----------
-
-function buildStandardPositives(text, lang) {
-  const t = (text || "").trim();
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  const out = [];
-  if (t.length >= 80) out.push(fr ? "Le texte est suffisamment développé pour être évalué." : "Text is sufficiently developed to evaluate.");
-  if (/\b(selon|peut-être|probablement|à ce stade|it seems|maybe|likely|according to)\b/i.test(t)) out.push(fr ? "Présence de nuances (prudence dans le ton)." : "Nuanced tone (some caution/hedging).");
-  if (hasUserProvidedSources(t)) out.push(fr ? "Des liens/sources semblent être fournis dans le texte." : "Some sources/links appear to be provided in the text.");
-  return out.slice(0, 3);
-}
-
-function buildStandardRisks(text, lang) {
-  const t = (text || "").trim();
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  const out = [];
-  if (/\b(toujours|jamais|100%|certain|preuve ultime|obvious|everyone knows)\b/i.test(t)) out.push(fr ? "Ton trop absolu (signal de manipulation possible)." : "Overly absolute tone (possible manipulation signal).");
-  if (/\b(ville|city|pays|country|capitale|capital)\b/i.test(t) && !hasUserProvidedSources(t)) out.push(fr ? "Affirmations factuelles sans source claire." : "Factual claims without clear sourcing.");
-  if (t.length < 35) out.push(fr ? "Texte très court : risque d’interprétation." : "Very short text: higher interpretation risk.");
-  return out.slice(0, 3);
-}
-
-function buildStandardMissingInfo(text, lang, providedSources) {
-  const t = (text || "").trim();
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  const out = [];
-  if (!providedSources) out.push(fr ? "Une ou deux sources fiables (lien) aideraient beaucoup." : "One or two reliable sources (links) would help a lot.");
-  if (!/\b\d{1,4}\b/.test(t)) out.push(fr ? "Des faits précis (dates/chiffres) rendraient l’affirmation plus vérifiable." : "Precise facts (dates/numbers) would make claims more verifiable.");
-  out.push(fr ? "PRO : vérifie plusieurs affirmations et fournit des preuves." : "PRO: checks multiple claims and provides evidence.");
-  return out.slice(0, 3);
-}
-
-// ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
-
-// Mini cache mémoire (évite de payer Serper 20 fois pour la même intention)
-// SAFE SWITCH:
-// - off   => cache exact seulement (comme avant)
-// - on    => Option C (sens + garde-fous + mini-Serper si borderline)
-// - debug => Option C + logs clairs
-const SIM_CACHE_MODE = (process.env.SIM_CACHE_MODE || process.env.IA11_CACHE_MODE || "on").toLowerCase();
-
-// Niveau 1: cache exact (clé normalisée)
-// Niveau 2: cache "similarité" (même sens + garde-fous)
-const PRO_CACHE = new Map(); // key -> { expiresAt, payload, profile, createdAt }
-const PRO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-// Pour éviter de scanner un cache infini (RAM), on limite les comparaisons
-const PRO_CACHE_MAX_SCAN = 1500;
-
-// Stopwords simples (FR/EN) pour extraire le "sujet"
-const STOP_FR = new Set([
-  "le","la","les","un","une","des","du","de","d","au","aux","a","à","en","dans","sur","sous","chez",
-  "et","ou","mais","donc","or","ni","car","que","qui","quoi","dont","où",
-  "est","sont","été","etre","être","avait","ont","avoir",
-  "ce","cet","cette","ces","cela","ça","se","sa","son","ses","leur","leurs","mon","ma","mes","ton","ta","tes","nos","vos",
-  "plus","moins","tres","très","pas","ne","non","oui",
-  "il","elle","ils","elles","on","nous","vous","tu","je","j",
-  "aujourd","hui","hier","demain"
-]);
-
-const STOP_EN = new Set([
-  "the","a","an","and","or","but","so","because","of","to","in","on","at","by","for","with","from","as",
-  "is","are","was","were","be","been","being","have","has","had",
-  "this","that","these","those","it","its","they","them","we","you","i",
-  "not","no","yes","very","more","less","than"
-]);
-
-// Mini table de synonymes (juste pour capturer les cas fréquents, pas pour être parfait)
-function synonymMapToken(tok, lang) {
-  const t = tok;
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  // === Ultra Pro: synonymes "sens" (FR/EN) ===
-  // Ville
-  if (t === "city" || t === "town") return "ville";
-  if (t === "ville") return "ville";
-
-  // Pays
-  if (t === "country") return "pays";
-  if (t === "pays") return "pays";
-
-  // États-Unis / USA
-  if (t === "united" || t === "states" || t === "america" || t === "american") return "usa";
-  if (t === "etats" || t === "etat" || t === "unis" || t === "américains" || t === "americains") return "usa";
-  if (t === "états" || t === "état") return "usa";
-
-  // Nord (petit bonus utile)
-  if (t === "above" || t === "over") return "north";
-  if (t === "north" || t === "northern") return "north";
-  if (t === "au-dessus" || t === "dessus") return "nord";
-  if (t === "nord" || t === "nordest" || t === "nord-ouest") return "nord";
-
-  // Amérique
-  if (t === "amérique" || t === "amerique") return "amerique";
-
-  return t;
-}
-
-
-function purgeExpiredProCache() {
-  const now = Date.now();
-  for (const [k, v] of PRO_CACHE.entries()) {
-    if (!v || now > v.expiresAt) PRO_CACHE.delete(k);
-  }
-}
-
-function cacheGet(key) {
-  const v = PRO_CACHE.get(key);
-  if (!v) return null;
-  if (Date.now() > v.expiresAt) {
-    PRO_CACHE.delete(key);
-    return null;
-  }
-  return v.payload;
-}
-
-// profile optionnel: { tokens:Set<string>, topicKey:string }
-function cacheSet(key, payload, profile) {
-  PRO_CACHE.set(key, {
-    expiresAt: Date.now() + PRO_CACHE_TTL_MS,
-    createdAt: Date.now(),
-    payload,
-    profile: profile || null,
-  });
-}
-
-function normalizeClaimForCache(text, lang) {
-  // Niveau 1 (exact): clé stable, robuste aux ponctuations/espaces
-  const t = safeLower(text || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "") // enlève accents
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, "")
-    .trim()
-    .slice(0, 220);
-
-  return `${(lang || "en").toLowerCase()}::${t}`;
-}
-
-function buildProSimilarityProfile(text, lang) {
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-  // Stopwords combinés + mots génériques fréquents qui polluent la similarité
-  const stop = new Set([
-    ...STOP_FR,
-    ...STOP_EN,
-
-  // bruit générique
-  "est", "des", "plus",
-  "situe", "situé", "situer",
-  "america", "amerique", "amérique",
-
-  // adjectifs “décoratifs” qui ne doivent pas coûter des crédits Serper
-  // FR
-  "gros","grosse","grand","grande","petit","petite",
-  "enorme","énorme","immense","gigantesque",
-  "grosser","petiter", // au cas où (fautes)
-  "grands","grandes","petits","petites","grosses",
-
-  // EN
-  "big","small","large","huge","tiny","massive","giant"
-]);
-
-
-
-  const cleaned = safeLower(text || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 260);
-
-  const rawTokens = cleaned.split(" ").filter(Boolean);
-
-  const tokens = new Set();
-  for (let tok of rawTokens) {
-    if (!tok) continue;
-    if (tok.length <= 2) continue;
-    if (stop.has(tok)) continue;
-    tok = synonymMapToken(tok, lang);
-    if (!tok || tok.length <= 2) continue;
-    if (stop.has(tok)) continue;
-    tokens.add(tok);
-  }
-
-  // Sujet (garde-fou): top 4 tokens triés
-  // TopicKey "ancré" pour stabiliser les reformulations (Canada / USA)
-const anchors = ["canada", "usa", "etats", "unis", "états", "united", "states"];
-const anchorHits = anchors.filter(a => tokens.has(a));
-
-const topicKey = (anchorHits.length >= 2)
-  ? anchorHits.slice(0, 2).sort().join("|")
-  : Array.from(tokens).sort().slice(0, 2).join("|");
-
-
-  return { tokens, topicKey };
-}
-
-function jaccardSimilarity(aSet, bSet) {
-  if (!aSet || !bSet) return 0;
-  const a = aSet.size;
-  const b = bSet.size;
-  if (a === 0 || b === 0) return 0;
-
-  let inter = 0;
-  for (const x of aSet) if (bSet.has(x)) inter++;
-
-  const union = a + b - inter;
-  const base = union <= 0 ? 0 : inter / union;
-
-  // Ultra Pro boost: si le "noyau" (top tokens) est identique, on pousse le score
-  const coreA = Array.from(aSet).sort().slice(0, 2).join("|");
-  const coreB = Array.from(bSet).sort().slice(0, 2).join("|");
-  if (coreA && coreA === coreB) return Math.min(1, base + 0.25);
-
-  return base;
-}
-
-// Option C: sens + garde-fous + mini-Serper si borderline
-// Option C: sens + garde-fous + mini-Serper si borderline
-function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
-  purgeExpiredProCache();
-
-  // 1) exact cache
-  const exactPayload = cacheGet(exactKey);
-  if (exactPayload) {
-    return { hit: true, tier: "exact", payload: exactPayload, matchedKey: exactKey, score: 1 };
-  }
-
-  // SAFE: mode OFF => on ne fait PAS de similarité
-  if (SIM_CACHE_MODE === "off") return { hit: false };
-
-  // 2) similarité
-  let best = null;
-  let scanned = 0;
-
-  for (const [k, entry] of PRO_CACHE.entries()) {
-    if (!entry || !entry.payload) continue;
-    if (!entry.profile || !entry.profile.tokens) continue;
-
-    scanned++;
-    if (scanned > PRO_CACHE_MAX_SCAN) break;
-
-    // Garde-fou sujet: topicKey identique (évite les faux matchs)
-    if (profile.topicKey && entry.profile.topicKey && profile.topicKey !== entry.profile.topicKey) continue;
-
-    const sim = jaccardSimilarity(profile.tokens, entry.profile.tokens);
-    if (!best || sim > best.score) best = { key: k, score: sim, payload: entry.payload };
-  }
-
-  if (!best) return { hit: false };
-
-    const HIGH = SIMILARITY_STRICT_MODE ? 0.80 : 0.74; // plus strict = moins de faux "cache hit"
-    const MID  = SIMILARITY_STRICT_MODE ? 0.68 : 0.60; // borderline plus rare
-
-
-  if (best.score >= HIGH) {
-    return { hit: true, tier: "similar", payload: best.payload, matchedKey: best.key, score: best.score };
-  }
-
-  if (best.score >= MID) {
-    return { hit: true, tier: "borderline", payload: best.payload, matchedKey: best.key, score: best.score };
-  }
-
-  return { hit: false };
-}
-
 function extractMainClaim(text) {
-  const t = (text || "").trim();
+  const t = stripSpaces(text);
   if (!t) return "";
-  // prend la 1re phrase courte (sinon début)
-  const parts = t.replace(/\s+/g, " ").split(/(?<=[.!?])\s+/).filter(Boolean);
-  return (parts[0] || t).trim().slice(0, 240);
+  // Take first sentence-ish
+  const first = t.split(/[\.\n]/)[0];
+  return stripSpaces(first).slice(0, 180);
 }
 
-  function stanceFromText(snippetOrTitle) {
-  // Fallback (quand on ne peut pas comparer au claim)
-  const s = safeLower(snippetOrTitle);
-
-  const refuteWords = [
-    "false", "debunk", "hoax", "myth", "not true", "refuted", "misleading", "fake",
-    "faux", "canular", "démenti", "dementi", "trompeur", "incorrect", "inexact"
-  ];
-
-  const supportWords = [
-    "confirmed", "official", "announced", "statement", "report", "according to",
-    "communiqué", "communique", "déclare", "declare", "rapport", "evidence", "verified"
-  ];
-
-  let refute = 0;
-  let support = 0;
-
-  for (const w of refuteWords) if (s.includes(w)) refute++;
-  for (const w of supportWords) if (s.includes(w)) support++;
-
-  if (refute > support) return "refute";
-  if (support > refute) return "support";
-  return "unknown";
+function looksLikeVerifiableClaim(claim) {
+  const c = safeLower(claim || "");
+  if (!c) return false;
+  if (c.length < 12) return false;
+  if (/(je pense|opinion|feel|j'aime|j’aime|à mon avis|imo|imho)/i.test(c)) return false;
+  return true;
 }
 
-function stripDiacritics(s) {
-  return (s || "")
-    .toString()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function normText(s) {
-  return stripDiacritics(s)
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeEntityName(s) {
-  return normText(s)
-    .replace(/\b(the|a|an|la|le|les|l|de|du|des|of)\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function tokenSetFromText(s) {
-  const toks = normText(s).split(" ").filter((t) => t.length >= 3);
-  return new Set(toks);
-}
-
-function overlapCount(setA, setB) {
-  let c = 0;
-  for (const t of setA) if (setB.has(t)) c++;
-  return c;
-}
-
-// Détecte une claim de type “X est la capitale du/de Y” ou “X is the capital of Y”
-function extractCapitalClaimParts(claim) {
-  const raw = (claim || "").trim();
-  if (!raw) return null;
-
-  // FR
-  const fr = raw.match(/^(.*?)\s+(est|serait)\s+(la\s+)?capitale\s+(du|de la|de l'|des)\s+(.*)$/i);
-  if (fr) {
-    const city = fr[1].trim();
-    const country = fr[5].trim();
-    if (city && country) return { city, country, lang: "fr" };
-  }
-
-  // EN
-  const en = raw.match(/^(.*?)\s+(is|was|would be)\s+(the\s+)?capital\s+of\s+(.*)$/i);
-  if (en) {
-    const city = en[1].trim();
-    const country = en[4].trim();
-    if (city && country) return { city, country, lang: "en" };
-  }
-
-  return null;
-}
-
-// Extrait “la capitale de X est Y” / “capital of X is Y”
-function extractCapitalFromSnippet(snippet) {
-  const s = (snippet || "").replace(/\s+/g, " ").trim();
-  if (!s) return null;
-
-  // EN: "The capital of Canada is Ottawa"
-  let m = s.match(/capital\s+of\s+([^.,;:()\n]+?)\s+(is|was)\s+([^.,;:()\n]+)/i);
-  if (m) return { country: m[1].trim(), capital: m[3].trim() };
-
-  // EN: "Ottawa is the capital of Canada"
-  m = s.match(/([^.,;:()\n]+?)\s+(is|was)\s+(the\s+)?capital\s+of\s+([^.,;:()\n]+)/i);
-  if (m) return { capital: m[1].trim(), country: m[4].trim() };
-
-  // FR: "La capitale du Canada est Ottawa"
-  m = s.match(/capitale\s+(du|de la|de l'|des)\s+([^.,;:()\n]+?)\s+est\s+([^.,;:()\n]+)/i);
-  if (m) return { country: m[2].trim(), capital: m[3].trim() };
-
-  // FR: "Ottawa est la capitale du Canada"
-  m = s.match(/([^.,;:()\n]+?)\s+est\s+(la\s+)?capitale\s+(du|de la|de l'|des)\s+([^.,;:()\n]+)/i);
-  if (m) return { capital: m[1].trim(), country: m[5].trim() };
-
-  return null;
-}
-
-/**
- * Compare un résultat web au claim.
- * Retourne un stance *contre le claim*, pas juste “mots positifs/négatifs”.
- */
-function classifyItemAgainstClaim(claim, title, snippet, lang) {
-  const combined = `${title || ""} ${snippet || ""}`.trim();
-
-  const claimTokens = tokenSetFromText(claim);
-  const itemTokens = tokenSetFromText(combined);
-
-  const ov = overlapCount(claimTokens, itemTokens);
-
-  // Relevance simple (0..100)
-  let relevance = 25;
-  if (ov >= 6) relevance = 95;
-  else if (ov >= 4) relevance = 80;
-  else if (ov >= 2) relevance = 60;
-  else if (ov >= 1) relevance = 45;
-
-  // 1) Cas capital/capitale (critique)
-  const cap = extractCapitalClaimParts(claim);
-  if (cap) {
-    const found = extractCapitalFromSnippet(combined);
-    if (found) {
-      const claimCity = normalizeEntityName(cap.city);
-      const foundCapital = normalizeEntityName(found.capital);
-      const claimCountry = normalizeEntityName(cap.country);
-      const foundCountry = normalizeEntityName(found.country || "");
-
-      const countryLooksSame =
-        !!claimCountry &&
-        !!foundCountry &&
-        (foundCountry.includes(claimCountry) || claimCountry.includes(foundCountry) || overlapCount(tokenSetFromText(claimCountry), tokenSetFromText(foundCountry)) >= 1);
-
-      if (countryLooksSame) {
-        if (foundCapital && claimCity && foundCapital !== claimCity) {
-          return { stance: "refute", relevance: 95, strength: 95, reason: "capital_mismatch", extracted: { capital: found.capital, country: found.country } };
-        }
-        if (foundCapital && claimCity && foundCapital === claimCity) {
-          return { stance: "support", relevance: 95, strength: 90, reason: "capital_match", extracted: { capital: found.capital, country: found.country } };
-        }
-      }
+async function runStandardRealityCheck(text, language, claimHint) {
+  try {
+    if (!SERPER_KEY) {
+      return { used: false, realityScore: 55, verdict: null, checkedClaim: null };
     }
 
-    return { stance: "unknown", relevance: Math.max(relevance, 55), strength: 0, reason: "capital_unresolved", extracted: null };
-  }
+    const claim = stripSpaces(claimHint || extractMainClaim(text));
+    const l = (language || "en").toLowerCase();
+    const fr = l.startsWith("fr");
 
-  // 2) Fallback: seulement si pertinent
-  const fallback = stanceFromText(combined);
-  if (relevance >= 60) return { stance: fallback, relevance, strength: fallback === "unknown" ? 0 : 55, reason: "fallback_keywords", extracted: null };
+    if (!claim) return { used: false, realityScore: 55, verdict: null, checkedClaim: null };
 
-  return { stance: "unknown", relevance, strength: 0, reason: "low_relevance", extracted: null };
-}
+    // CACHED? exact or similar
+    const cached = getCachedSerperSimilar(claim, l);
+    if (cached) {
+      // Minimal “reality score” from cached results
+      const realityScore = estimateRealityFromSearch(cached, fr);
+      return {
+        used: true,
+        fromCache: true,
+        realityScore,
+        verdict: fr ? "Mini vérif via cache." : "Mini check via cache.",
+        checkedClaim: claim,
+      };
+    }
 
+    const sr = await serperSearch(claim, l, 5);
+    if (!sr.ok) {
+      return { used: false, realityScore: 55, verdict: sr.error || null, checkedClaim: claim };
+    }
 
-// Requêtes PRO: max 3, ultra ciblées
-function buildProQueries(claim, lang) {
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-  const c = (claim || "").trim();
-  const lower = safeLower(c);
+    setCachedSerper(claim, l, sr.items);
 
-  const queries = [];
+    const realityScore = estimateRealityFromSearch(sr.items, fr);
 
-  // 1) La claim brute (toujours)
-  if (c) queries.push(c);
-
-  // 2) Si ça ressemble à un poste officiel → requête “current + poste”
-  const looksOfficial =
-    lower.includes("président") ||
-    lower.includes("president") ||
-    lower.includes("prime minister") ||
-    lower.includes("premier ministre") ||
-    lower.includes("pape") ||
-    lower.includes("pope");
-
-  if (looksOfficial) {
-    queries.push(fr ? `président actuel ${c}` : `current ${c}`);
-  } else {
-    // sinon fact-check simple
-    queries.push(fr ? `${c} vérification des faits` : `${c} fact check`);
-  }
-
-  // 3) Requête “official source” (seulement si pro et claim pas trop longue)
-  if (c && c.length < 160) {
-    queries.push(fr ? `${c} source officielle` : `${c} official source`);
-  }
-
-  return queries.slice(0, 3);
-}
-
-function scoreEvidenceBrutal(enrichedItems, verifiable) {
-  const list = enrichedItems || [];
-  if (list.length === 0) {
     return {
-      evidenceScore: verifiable ? 40 : 45,
-      confidence: 20,
-      hasContradictions: false,
-      strongRefute: false,
-      strongSupport: false,
-      notes: ["no_sources"],
+      used: true,
+      fromCache: false,
+      realityScore,
+      verdict: fr
+        ? "Mini vérification web effectuée (1 requête)."
+        : "Minimal web check completed (1 query).",
+      checkedClaim: claim,
     };
+  } catch (e) {
+    return { used: false, realityScore: 55, verdict: e.message || "error", checkedClaim: null };
   }
+}
 
-  const domains = new Set();
+function estimateRealityFromSearch(items, fr) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return 55;
 
-  let relSum = 0;
-  let relvSum = 0;
-
-  // Poids “contre le claim”
-  let supportW = 0;
-  let refuteW = 0;
-
-  let support = 0;
-  let refute = 0;
-  let unknown = 0;
+  // Heuristic: if many high-trust domains appear, higher confidence
+  const trusted = ["wikipedia.org", "britannica.com", "who.int", "cdc.gov", "nih.gov", "un.org", "oecd.org", "worldbank.org", "statcan.gc.ca", "gouv.qc.ca", "gc.ca"];
+  let trustHits = 0;
 
   for (const it of list) {
-    const rel = it.reliability || 50;
-    const relv = typeof it.relevance === "number" ? it.relevance : 50;
-
-    relSum += rel;
-    relvSum += relv;
-    if (it.domain) domains.add(it.domain);
-
-    const stance = it.stance || "unknown";
-    if (stance === "support") support++;
-    else if (stance === "refute") refute++;
-    else unknown++;
-
-    // Poids: qualité * pertinence (0..1.0)
-    const w = (Math.max(0, Math.min(100, rel)) / 100) * (Math.max(0, Math.min(100, relv)) / 100);
-
-    if (stance === "support") supportW += w;
-    else if (stance === "refute") refuteW += w;
+    const d = domainOf(it.link || it.url || "");
+    if (trusted.includes(d)) trustHits++;
   }
 
-  const avgRel = relSum / Math.max(1, list.length);
-  const avgRelevance = relvSum / Math.max(1, list.length);
-  const diversity = domains.size;
-
-  const hasContradictions = supportW > 0.3 && refuteW > 0.3;
-
-  // “Forte” = poids largement dominant + un minimum de qualité/pertinence
-  const strongRefute =
-    refuteW >= Math.max(0.9, supportW * 2.0) && avgRel >= 65 && avgRelevance >= 55;
-
-  const strongSupport =
-    supportW >= Math.max(0.9, refuteW * 2.0) && avgRel >= 65 && avgRelevance >= 55;
-
-  // Base
-  let evidenceScore = 50;
-
-  // 1) Pertinence d'abord
-  if (avgRelevance >= 80) evidenceScore += 10;
-  else if (avgRelevance >= 60) evidenceScore += 6;
-  else evidenceScore -= 8;
-
-  // 2) Qualité (mais pas “cadeau”)
-  if (avgRel >= 85) evidenceScore += 10;
-  else if (avgRel >= 70) evidenceScore += 6;
-  else evidenceScore += 2;
-
-  // 3) Diversité (petit bonus)
-  if (diversity >= 5) evidenceScore += 6;
-  else if (diversity >= 3) evidenceScore += 4;
-  else if (diversity >= 2) evidenceScore += 2;
-
-  // 4) Direction (support vs refute)
-  const diff = supportW - refuteW;
-  evidenceScore += Math.round(diff * 25);
-
-  // Contradictions
-  if (hasContradictions) evidenceScore -= 8;
-
-  // Verdict brutal
-  if (strongRefute) evidenceScore = Math.min(evidenceScore, 12);
-  if (strongSupport) evidenceScore = Math.max(evidenceScore, 82);
-
-  const notes = [];
-  if (hasContradictions) notes.push("mixed_signals");
-  if (strongRefute) notes.push("strong_refutation");
-  if (strongSupport) notes.push("strong_corroboration");
-  if (avgRel >= 85) notes.push("high_quality_sources");
-  if (avgRelevance < 50) notes.push("low_relevance");
-
-  // Si vérifiable MAIS pas de verdict clair → prudence (retour “comme avant”)
-  if (verifiable && !strongSupport && !strongRefute) {
-    notes.push("no_clear_verdict");
-    evidenceScore = Math.min(evidenceScore, 55);
-  }
-
-  evidenceScore = Math.max(0, Math.min(100, Math.round(evidenceScore)));
-
-  // Confiance
-  let confidence = 35;
-  confidence += Math.round((avgRel - 50) * 0.5);
-  confidence += Math.round((avgRelevance - 50) * 0.4);
-  confidence += Math.min(18, diversity * 3);
-  if (hasContradictions) confidence -= 10;
-  if (strongRefute || strongSupport) confidence += 10;
-  confidence = Math.max(0, Math.min(100, Math.round(confidence)));
-
-  return { evidenceScore, confidence, hasContradictions, strongRefute, strongSupport, notes };
+  if (trustHits >= 2) return 70;
+  if (trustHits === 1) return 63;
+  return 55;
 }
 
-async function runProEvidence(text, lang) {
-    try {
+// =====================
+// PRO CORE (Evidence + buckets + sources)
+// =====================
 
-    // Le claim (le coeur du fact-check)
-  const claim = extractMainClaim(text);
+function reliabilityFromDomain(domain) {
+  const d = (domain || "").toLowerCase();
+  if (!d) return "unknown";
 
-  // Verifiable = on doit être strict (capitale, dates, chiffres, etc.)
-  const verifiable = looksLikeVerifiableClaim(claim || text);
+  const high = [
+    "who.int",
+    "cdc.gov",
+    "nih.gov",
+    "un.org",
+    "oecd.org",
+    "worldbank.org",
+    "statcan.gc.ca",
+    "gc.ca",
+    "gouv.qc.ca",
+    "nature.com",
+    "science.org",
+    "nejm.org",
+    "thelancet.com",
+    "reuters.com",
+    "apnews.com",
+    "bbc.co.uk",
+    "bbc.com",
+    "nytimes.com",
+    "washingtonpost.com",
+    "theguardian.com",
+    "economist.com",
+    "britannica.com",
+    "wikipedia.org"
+  ];
 
-  // Cache basé sur le claim (pas sur le texte complet)
-  const rawForCache = (claim || text || "").slice(0, 500);
-  const cacheKey = normalizeClaimForCache(rawForCache, lang);
-  const profile = buildProSimilarityProfile(rawForCache, lang);
+  const medium = [
+    "medium.com",
+    "forbes.com",
+    "bloomberg.com",
+    "cnbc.com",
+    "theconversation.com",
+    "wired.com",
+    "theverge.com"
+  ];
 
+  if (high.includes(d)) return "high";
+  if (medium.includes(d)) return "medium";
+  return "low";
+}
 
-  // 1) lookup cache (exact -> similar -> borderline)
-  const hit = proCacheLookupBySimilarity(claim, lang, cacheKey, profile);
+function stanceHeuristic(text, claim) {
+  // Very lightweight stance: unknown/neutral by default
+  // (You can upgrade later with NLP)
+  return "neutral";
+}
 
-  // DEBUG: voir ce que IA11 “pense”
-  if (SIM_CACHE_MODE === "debug") {
-    console.log("🧠 SIM_CACHE_MODE:", SIM_CACHE_MODE, "topicKey:", profile.topicKey, "tokens:", Array.from(profile.tokens).slice(0, 12));
-    console.log("🧠 CACHE LOOKUP:", hit);
-  }
+async function runProEvidence(text, language) {
+  const l = (language || "en").toLowerCase();
+  const fr = l.startsWith("fr");
 
-  // HIT exact / similar: 0$ Serper
-  if (hit && hit.hit && (hit.tier === "exact" || hit.tier === "similar")) {
-    // Bonus: alias la nouvelle formulation vers le même payload
-    if (hit.tier === "similar") {
-      cacheSet(cacheKey, hit.payload, profile);
-    }
+  const claim = stripSpaces(extractMainClaim(text)) || stripSpaces(text).slice(0, 200);
 
-    if (SIM_CACHE_MODE === "debug") {
-      console.log("🧠 CACHE HIT:", { tier: hit.tier, score: hit.score, matchedKey: hit.matchedKey });
-    }
+  // Queries (max controlled)
+  const q1 = claim;
+  const q2 = `fact check ${claim}`;
+  const q3 = `${claim} source`;
+  const q4 = `${claim} statistics`;
 
-    return {
-      ...hit.payload,
-      fromCache: true,
-      cacheHit: { tier: hit.tier, score: hit.score, matchedKey: hit.matchedKey },
-    };
-  }
-
-  // HIT borderline: mini-Serper (moins de résultats) pour sécuriser la crédibilité
-  const isBorderline = !!(hit && hit.hit && hit.tier === "borderline");
-
-  const queries = buildProQueries(claim, lang);
+  const queries = [q1, q2, q3, q4].filter(Boolean).slice(0, clamp(MAX_SERPER_QUERIES_ENV, 1, 4));
 
   let allItems = [];
-  let okCount = 0;
-  let lastError = null;
+  let usedQueries = 0;
+  let fromCache = false;
 
-  // SAFE: si OFF, on force le comportement “normal” (3 requêtes / 5 résultats)
-  const baseMax = Math.max(1, Math.min(8, MAX_SERPER_QUERIES_ENV || 4));
-  const maxQueries = (SIM_CACHE_MODE === "off") ? 3 : (isBorderline ? 1 : baseMax);
-  const numPerQuery = (SIM_CACHE_MODE === "off") ? 5 : (isBorderline ? 3 : 5);
-
-
-  if (SIM_CACHE_MODE === "debug") {
-    console.log("🧠 SERPER PLAN:", { isBorderline, maxQueries, numPerQuery, queriesPreview: queries.slice(0, 3) });
-  }
-
-  for (let i = 0; i < Math.min(maxQueries, queries.length); i++) {
-    const q = queries[i];
-
-    try {
-      const out = await serperSearch(q, lang, numPerQuery);
-      if (out.ok) {
-        okCount++;
-        allItems = allItems.concat(out.items || []);
-      } else {
-        lastError = out.error || lastError;
-      }
-    } catch (e) {
-      lastError = e?.message || lastError;
+  for (const q of queries) {
+    // Try cache exact/similar
+    const cached = getCachedSerperSimilar(q, l);
+    if (cached) {
+      fromCache = true;
+      allItems = allItems.concat(cached);
+      usedQueries++;
+      continue;
     }
 
-    // Stop early: si on a déjà 8 items dédupliqués, c’est suffisant pour un verdict pro
-    const fastDedup = dedupeItems(allItems);
-    if (SIM_CACHE_MODE !== "off" && !isBorderline && fastDedup.length >= 8) break;
+    const sr = await serperSearch(q, l, 5);
+    usedQueries++;
+
+    if (sr.ok) {
+      setCachedSerper(q, l, sr.items);
+      allItems = allItems.concat(sr.items);
+    } else {
+      // ignore failures, keep going
+    }
   }
 
-     const deduped = dedupeItems(allItems).slice(0, 10);
-  const enriched = deduped.map((it) => {
-    const link = it.link || it.url || "";
-    const domain = getDomain(link);
-    const title = it.title || "";
-    const snippet = it.snippet || it.description || "";
-    const reliability = domainReliability(domain);
-
-    const cls = classifyItemAgainstClaim(claim, title, snippet, lang);
-
+  // Normalize serper item format into {title,url,domain,snippet}
+  const normalized = (allItems || []).map((it) => {
+    const url = normalizeUrl(it.link || it.url || "");
+    const domain = domainOf(url);
     return {
-      title,
-      url: link,
-      link, // compat
-      snippet,
+      title: it.title || "",
+      url,
       domain,
-      reliability,
-      stance: cls.stance,
-      relevance: cls.relevance,
-      strength: cls.strength,
-      stanceReason: cls.reason,
-      extracted: cls.extracted || null,
+      snippet: it.snippet || it.description || "",
+      reliability: reliabilityFromDomain(domain),
+      stance: stanceHeuristic(text, claim),
     };
   });
 
-
-  // Buckets (wow)
-  const buckets = { corroborates: [], contradicts: [], neutral: [] };
-  for (const it of enriched) {
-    if (it.stance === "support") buckets.corroborates.push(it);
-    else if (it.stance === "refute") buckets.contradicts.push(it);
-    else buckets.neutral.push(it);
+  // De-dup by url
+  const seen = new Set();
+  const items = [];
+  for (const it of normalized) {
+    if (!it.url) continue;
+    if (seen.has(it.url)) continue;
+    seen.add(it.url);
+    items.push(it);
   }
 
-   
-    const evidence = scoreEvidenceBrutal(enriched, verifiable);
-    
-
-
-  const payload = {
-    ok: okCount > 0,
-    claim,
-    queriesUsed: queries,
-    items: enriched,
-    buckets,
-    evidence,
-    error: okCount > 0 ? null : lastError || "Unknown search error",
+  // Buckets (simple)
+  const buckets = {
+    corroborates: [],
+    contradicts: [],
+    neutral: [],
   };
 
-  // Si borderline et Serper n'a rien donné: fallback prudent sur le cache similaire
-  if (SIM_CACHE_MODE !== "off" && isBorderline && okCount === 0 && hit && hit.payload) {
-    const fallback = {
-      ...hit.payload,
-      ok: hit.payload.ok || false,
-      fromCache: true,
-      cacheHit: { tier: "borderline-fallback", score: hit.score, matchedKey: hit.matchedKey },
-      note: (lang || "en").toLowerCase().startsWith("fr")
-        ? "Mini-recherche web indisponible; réutilisation prudente d’un résultat similaire en cache."
-        : "Mini web search unavailable; cautiously reusing a similar cached result.",
-    };
-
-    cacheSet(cacheKey, fallback, profile);
-
-    if (SIM_CACHE_MODE === "debug") {
-      console.log("🧠 BORDERLINE FALLBACK USED");
-    }
-
-    return { ...fallback, fromCache: true };
+  for (const it of items.slice(0, 12)) {
+    // placeholder: keep neutral
+    buckets.neutral.push({
+      title: it.title,
+      url: it.url,
+      domain: it.domain,
+      snippet: it.snippet,
+    });
   }
 
-  cacheSet(cacheKey, payload, profile);
-
-  if (SIM_CACHE_MODE === "debug") {
-    console.log("🧠 CACHE STORE:", { cacheKey, topicKey: profile.topicKey, okCount, isBorderline });
-  }
+  const evidence = buildEvidenceScore(items, fr);
 
   return {
-    ...payload,
-    fromCache: false,
-    cacheHit: (SIM_CACHE_MODE === "off")
-      ? null
-      : (isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null)
+    claim,
+    items,
+    buckets,
+    queriesUsed: usedQueries,
+    fromCache,
+    evidence,
   };
-    } catch (err) {
-    console.error("runProEvidence crash:", err);
+}
 
+function buildEvidenceScore(items, fr) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
     return {
-      ok: false,
-      claim: extractMainClaim(text),
-      queriesUsed: [],
-      items: [],
-      buckets: { corroborates: [], contradicts: [], neutral: [] },
-      evidence: {
-        evidenceScore: 45,
-        confidence: 10,
-        hasContradictions: false,
-        strongRefute: false,
-        strongSupport: false,
-        notes: ["runProEvidence_crash"],
-      },
-      error: err?.message || "runProEvidence_crash",
+      evidenceScore: 45,
+      confidence: 10,
+      strongRefute: false,
+      notes: [fr ? "Peu de sources trouvées." : "Few sources found."],
     };
   }
 
+  let score = 55;
+  let confidence = 20;
+  let high = 0;
+  let med = 0;
+  let low = 0;
+
+  for (const it of list.slice(0, 10)) {
+    if (it.reliability === "high") high++;
+    else if (it.reliability === "medium") med++;
+    else low++;
+  }
+
+  score += high * 10 + med * 4 - low * 2;
+  confidence += high * 12 + med * 5 - low * 2;
+
+  score = clamp(Math.round(score), 5, 95);
+  confidence = clamp(Math.round(confidence), 5, 95);
+
+  return {
+    evidenceScore: score,
+    confidence,
+    strongRefute: false,
+    notes: [],
+  };
 }
 
-function computeProFinalScore(text, lang, writingScore, evidenceScore, strongRefute, verifiable) {
-  // Score PRO = 80% preuve + 20% écriture (ultra logique)
-  let pro = Math.round(0.2 * writingScore + 0.8 * evidenceScore);
+function computeProFinalScore(text, language, writingScore, evidenceScore, strongRefute, verifiable) {
+  // Weighted blend
+  let score = Math.round(0.35 * writingScore + 0.65 * evidenceScore);
 
-  // Règle anti-absurde : si forte contradiction, ça ne monte JAMAIS
-  if (strongRefute) pro = Math.min(pro, 15);
+  // If strong refutation, crush score (but not absolute)
+  if (strongRefute) score = Math.min(score, 18);
 
-  // Si c’est non vérifiable (opinion), on évite de “punir” trop fort
-  if (!verifiable && pro < 35) pro = 35;
+  // If claim not verifiable, mild penalty
+  if (!verifiable) score -= 8;
 
-  // Clamp
-  pro = Math.max(0, Math.min(100, pro));
-  return pro;
+  return clamp(score, 0, 100);
 }
 
-function labelFromScore(lang, score) {
-  const l = (lang || "en").toLowerCase();
+function buildProExplanation(language, claim, evidence, buckets) {
+  const l = (language || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
-  if (fr) {
-    if (score >= 80) return "HAUTE CRÉDIBILITÉ";
-    if (score >= 65) return "BONNE CRÉDIBILITÉ";
-    if (score >= 50) return "CRÉDIBILITÉ MODÉRÉE";
-    if (score >= 30) return "FAIBLE CRÉDIBILITÉ";
-    return "TRÈS FAIBLE CRÉDIBILITÉ";
-  } else {
-    if (score >= 80) return "HIGH CREDIBILITY";
-    if (score >= 65) return "GOOD CREDIBILITY";
-    if (score >= 50) return "MODERATE CREDIBILITY";
-    if (score >= 30) return "LOW CREDIBILITY";
-    return "VERY LOW CREDIBILITY";
-  }
+  const evScore = evidence?.evidenceScore ?? 0;
+  const conf = evidence?.confidence ?? 0;
+
+  const intro = fr
+    ? `Explication PRO (guide de crédibilité, pas un verdict).`
+    : `PRO explanation (credibility guidance, not an absolute verdict).`;
+
+  const claimLine = fr
+    ? `Claim analysé : ${claim || "(non spécifié)"}`
+    : `Analyzed claim: ${claim || "(not specified)"}`;
+
+  const scoreLine = fr
+    ? `Score preuves : ${evScore}/100 — Confiance : ${conf}/100.`
+    : `Evidence score: ${evScore}/100 — Confidence: ${conf}/100.`;
+
+  const bucketLine = fr
+    ? `Sources triées : corroboration / contradiction / neutre (selon signaux simples).`
+    : `Sources grouped: corroboration / contradiction / neutral (simple signals).`;
+
+  const cautions = fr
+    ? `Limites : les résultats dépendent des sources accessibles et du contexte.`
+    : `Limits: results depend on accessible sources and context.`;
+
+  return [intro, claimLine, scoreLine, bucketLine, cautions].join("\n");
 }
 
-// ---------------- ROUTE ----------------
+// =====================
+// MAIN API (Lovable-compatible)
+// =====================
 
-// ---------------- ROUTE ----------------
+// Optional auth: if IA11_API_KEY is set, require x-ia11-key header
+function authCheck(req, res) {
+  if (!IA11_KEY) return true;
+  if (req.headers["x-ia11-key"] !== IA11_KEY) {
+    res.status(401).json({ error: "Invalid key" });
+    return false;
+  }
+  return true;
+}
 
-app.post("/v1/analyze", async (req, res) => {
-  try {
-    if (req.headers["x-ia11-key"] !== IA11_KEY)
-      return res.status(401).json({ error: "Invalid key" });
+async function analyzeCore(req, { content, analysisType, language }) {
+  const text = content;
+  const mode = safeLower(analysisType) === "pro" ? "pro" : "standard";
 
-    const { text, mode, language } = req.body;
-    if (!text) return res.status(400).json({ error: "Text required" });
+  // RATE LIMIT (Standard vs Pro)
+  const limit = mode === "pro" ? RATE_LIMIT_PRO : RATE_LIMIT_STANDARD;
+  const rl = rateLimitCheck(req, mode, limit);
+  if (!rl.ok) {
+    const err = new Error("RATE_LIMIT");
+    err.httpStatus = 429;
+    err.retryAfterSec = rl.retryAfterSec;
+    err.limitPerMin = limit;
+    err.analysisType = mode;
+    throw err;
+  }
 
-    const normalizedMode = safeLower(mode) === "pro" ? "pro" : "standard";
-    // RATE LIMIT (Standard vs Pro)
-    const limit = normalizedMode === "pro" ? RATE_LIMIT_PRO : RATE_LIMIT_STANDARD;
-    const rl = rateLimitCheck(req, normalizedMode, limit);
-      
-      if (!rl.ok) {
-        res.set("Retry-After", String(rl.retryAfterSec));
-        return res.status(429).json({
-          error: "Rate limit exceeded",
-          mode: normalizedMode,
-          limitPerMin: limit,
-          retryAfterSec: rl.retryAfterSec,
-        });
-      }
+  // -----------------------
+  // STANDARD
+  // -----------------------
+  if (mode === "standard") {
+    const standardOut = computeStandard(text, language);
 
-        // STANDARD: Option B optimisée (70% texte + 30% mini reality-check 1 Serper)
-    if (normalizedMode === "standard") {
-      const standardOut = computeStandard(text, language);
+    // 1 mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
+    const reality = await runStandardRealityCheck(text, language, standardOut?.standard?.claimToCheck);
+    const realityScore = typeof reality?.realityScore === "number" ? reality.realityScore : 55;
 
-      // 1 seul mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
-      const reality = await runStandardRealityCheck(text, language, standardOut?.standard?.claimToCheck);
-      const realityScore = typeof reality?.realityScore === "number" ? reality.realityScore : 55;
-
-      const finalScore = Math.max(
-        0,
-        Math.min(
-          100,
-          Math.round(0.7 * (standardOut.textScore || 0) + 0.3 * realityScore)
-        )
-      );
-
-      const l = (language || "en").toLowerCase();
-      const fr = l.startsWith("fr");
-
-      // Résumé neutre + tease PRO (pas de sources, pas de verdict absolu)
-      const summary = `${standardOut.summary} ${standardOut?.bullets?.proTease || (fr ? "PRO : preuves + sources + explication complète." : "PRO: evidence + sources + full explanation.")}`;
-
-      return res.json({
-        status: "ok",
-        engine: "IA11 Ultra Pro",
-        result: {
-          mode: "standard",
-          score: finalScore,
-          label: labelFromScore(language, finalScore),
-          summary,
-          // IMPORTANT: Standard ne montre PAS de sources (ça reste un tease PRO)
-          sources: [],
-          standard: {
-            textScore: standardOut.textScore,
-            realityScore,
-            // mini blocs UI pour Lovable (résumé + faim du PRO)
-            bullets: standardOut.bullets,
-            // infos techniques (tu peux garder/masquer côté UI)
-            details: {
-              writingScore: standardOut?.standard?.writingScore,
-              capApplied: standardOut?.standard?.capApplied,
-              capReason: standardOut?.standard?.capReason,
-              claimChecked: reality?.checkedClaim || standardOut?.standard?.claimToCheck || null,
-              realityVerdict: reality?.verdict || null,
-              realityUsed: !!reality?.used,
-            },
-          },
-        },
-      });
-    }
-
-
-    // PRO: nécessite Serper
-    if (!SERPER_KEY)
-      return res.status(500).json({ error: "Missing SERPER_API_KEY" });
-
-    const writingScore = computeWritingScore(text);
-
-    const proSearch = await runProEvidence(text, language);
-
-    const verifiable = looksLikeVerifiableClaim(proSearch?.claim || text);
-
-    const evidenceScore = proSearch?.evidence?.evidenceScore ?? 45;
-    const confidence = proSearch?.evidence?.confidence ?? 10;
-    const strongRefute = proSearch?.evidence?.strongRefute ?? false;
-
-    const finalScore = computeProFinalScore(
-      text,
-      language,
-      writingScore,
-      evidenceScore,
-      strongRefute,
-      verifiable
-    );
-
-    const explanation = buildProExplanation(
-      language,
-      proSearch.claim,
-      proSearch.evidence,
-      proSearch.buckets
+    const finalScore = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(0.7 * (standardOut.textScore || 0) + 0.3 * realityScore)
+      )
     );
 
     const l = (language || "en").toLowerCase();
     const fr = l.startsWith("fr");
 
-    const summary = fr
-      ? (strongRefute
-          ? "Sources fiables consultées : contradiction forte. Crédibilité très faible."
-          : "Analyse PRO basée sur preuves : sources consultées et justification détaillée.")
-      : (strongRefute
-          ? "Reliable sources consulted: strong contradiction. Very low credibility."
-          : "PRO evidence-based analysis: sources consulted and detailed justification.");
+    const summary = `${standardOut.summary} ${
+      standardOut?.bullets?.proTease ||
+      (fr ? "PRO : preuves + sources + explication complète." : "PRO: evidence + sources + full explanation.")
+    }`;
 
-    // Sources cliquables (title + url + domain)
-    const sources = (proSearch.items || []).slice(0, 8).map((it) => ({
-      title: it.title,
-      url: it.url,
-      domain: it.domain,
-      reliability: it.reliability,
-      stance: it.stance,
-      snippet: it.snippet,
-    }));
+    // Breakdown minimal, compatible UI (points 0..100)
+    const breakdown = {
+      sources: { points: 0, reason: fr ? "Standard : pas de liens affichés (tease PRO)." : "Standard: no links displayed (PRO tease)." },
+      factual: { points: Math.round(realityScore), reason: reality?.verdict || "" },
+      tone: { points: Math.round(standardOut?.standard?.writingScore ?? standardOut?.textScore ?? 50), reason: fr ? "Qualité d'écriture et prudence." : "Writing quality and prudence." },
+      context: { points: 55, reason: fr ? "Contexte limité sans lecture d'article complet." : "Limited context without full-article reading." },
+      transparency: { points: 60, reason: fr ? "Guide de crédibilité, pas un verdict absolu." : "Credibility guidance, not an absolute verdict." },
+    };
+
+    return {
+      analysisType: "standard",
+      result: {
+        analysisType: "standard",
+        score: finalScore,
+        label: labelFromScore(language, finalScore),
+        summary,
+        articleSummary: "",
+        confidence: 0.35,
+        breakdown,
+        sources: [],
+        standard: {
+          textScore: standardOut.textScore,
+          realityScore,
+          bullets: standardOut.bullets,
+          details: {
+            writingScore: standardOut?.standard?.writingScore,
+            capApplied: standardOut?.standard?.capApplied,
+            capReason: standardOut?.standard?.capReason,
+            claimChecked: reality?.checkedClaim || standardOut?.standard?.claimToCheck || null,
+            realityVerdict: reality?.verdict || null,
+            realityUsed: !!reality?.used,
+          },
+        },
+      },
+    };
+  }
+
+  // -----------------------
+  // PRO
+  // -----------------------
+  if (!SERPER_KEY) {
+    const err = new Error("Missing SERPER_API_KEY");
+    err.httpStatus = 500;
+    throw err;
+  }
+
+  const writingScore = computeWritingScore(text);
+  const proSearch = await runProEvidence(text, language);
+
+  const verifiable = looksLikeVerifiableClaim(proSearch?.claim || text);
+
+  const evidenceScore = proSearch?.evidence?.evidenceScore ?? 45;
+  const confidencePct = proSearch?.evidence?.confidence ?? 10; // 0..100-ish
+  const strongRefute = proSearch?.evidence?.strongRefute ?? false;
+
+  const finalScore = computeProFinalScore(
+    text,
+    language,
+    writingScore,
+    evidenceScore,
+    strongRefute,
+    verifiable
+  );
+
+  const explanation = buildProExplanation(
+    language,
+    proSearch.claim,
+    proSearch.evidence,
+    proSearch.buckets
+  );
+
+  const l = (language || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  const summary = fr
+    ? (strongRefute
+        ? "Sources fiables consultées : contradiction forte. Crédibilité très faible."
+        : "Analyse PRO basée sur preuves : sources consultées et justification détaillée.")
+    : (strongRefute
+        ? "Reliable sources consulted: strong contradiction. Very low credibility."
+        : "PRO evidence-based analysis: sources consulted and detailed justification.");
+
+  const sources = (proSearch.items || []).slice(0, 8).map((it) => ({
+    title: it.title,
+    url: it.url,
+    domain: it.domain,
+    reliability: it.reliability,
+    stance: it.stance,
+    snippet: it.snippet,
+  }));
+
+  const breakdown = {
+    sources: { points: Math.max(10, Math.min(100, Math.round(evidenceScore))), reason: fr ? "Qualité/fiabilité des sources et cohérence." : "Source quality/reliability and coherence." },
+    factual: { points: Math.max(10, Math.min(100, Math.round(evidenceScore))), reason: fr ? "Alignement avec des sources vérifiables." : "Alignment with verifiable sources." },
+    tone: { points: Math.max(10, Math.min(100, Math.round(writingScore))), reason: fr ? "Prudence, formulations, signes d'exagération." : "Prudence, phrasing, exaggeration signals." },
+    context: { points: verifiable ? 70 : 45, reason: verifiable ? (fr ? "Affirmation vérifiable." : "Verifiable claim.") : (fr ? "Affirmation floue/difficile à vérifier." : "Vague/hard-to-verify claim.") },
+    transparency: { points: 75, reason: fr ? "Méthode et limites expliquées, pas de vérité absolue." : "Method and limits stated; no absolute truth claims." },
+  };
+
+  return {
+    analysisType: "pro",
+    result: {
+      analysisType: "pro",
+      score: finalScore,
+      label: labelFromScore(language, finalScore),
+      summary,
+      articleSummary: "",
+      confidence: Math.max(0.05, Math.min(0.95, (Number(confidencePct) || 10) / 100)),
+      breakdown,
+      corroboration: {
+        corroborates: (proSearch.buckets.corroborates || []).slice(0, 3),
+        contradicts: (proSearch.buckets.contradicts || []).slice(0, 3),
+        neutral: (proSearch.buckets.neutral || []).slice(0, 3),
+      },
+      pro: {
+        writingScore,
+        evidenceScore,
+        strongRefute,
+        explanation,
+        claim: proSearch.claim,
+        buckets: {
+          corroborates: (proSearch.buckets.corroborates || []).slice(0, 3),
+          contradicts: (proSearch.buckets.contradicts || []).slice(0, 3),
+          neutral: (proSearch.buckets.neutral || []).slice(0, 3),
+        },
+        queriesUsed: proSearch.queriesUsed,
+        fromCache: proSearch.fromCache,
+        notes: proSearch.evidence.notes || [],
+      },
+      sources,
+    },
+  };
+}
+
+app.post("/analyze", async (req, res) => {
+  try {
+    if (!authCheck(req, res)) return;
+
+    const { content, analysisType, language } = req.body || {};
+    if (!content) return res.status(400).json({ error: "content required" });
+
+    const out = await analyzeCore(req, { content, analysisType, language });
 
     return res.json({
       status: "ok",
       engine: "IA11 Ultra Pro",
-      result: {
-        mode: "pro",
-        score: finalScore,
-        label: labelFromScore(language, finalScore),
-        summary,
-        confidence,
-        pro: {
-          writingScore,
-          evidenceScore,
-          strongRefute,
-          explanation,
-          claim: proSearch.claim,
-          buckets: {
-            corroborates: (proSearch.buckets.corroborates || []).slice(0, 3),
-            contradicts: (proSearch.buckets.contradicts || []).slice(0, 3),
-            neutral: (proSearch.buckets.neutral || []).slice(0, 3),
-          },
-          queriesUsed: proSearch.queriesUsed,
-          fromCache: proSearch.fromCache,
-          notes: proSearch.evidence.notes || [],
-        },
-        sources, // <-- Lovable peut afficher ça en liens cliquables
-      },
+      analysisType: out.analysisType,
+      result: out.result,
     });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    const status = e.httpStatus || 500;
+    if (status === 429) {
+      res.set("Retry-After", String(e.retryAfterSec || 10));
+      return res.status(429).json({
+        error: "Rate limit exceeded",
+        analysisType: e.analysisType || "standard",
+        limitPerMin: e.limitPerMin || 0,
+        retryAfterSec: e.retryAfterSec || 10,
+      });
+    }
+    return res.status(status).json({ error: e.message || "IA11_ERROR" });
   }
 });
 
+// Legacy endpoint (older clients): { text, mode, language }
+app.post("/v1/analyze", async (req, res) => {
+  try {
+    if (!authCheck(req, res)) return;
 
+    const { text, mode, language } = req.body || {};
+    if (!text) return res.status(400).json({ error: "text required" });
+
+    const out = await analyzeCore(req, { content: text, analysisType: mode, language });
+
+    return res.json({
+      status: "ok",
+      engine: "IA11 Ultra Pro",
+      analysisType: out.analysisType,
+      result: out.result,
+    });
+  } catch (e) {
+    const status = e.httpStatus || 500;
+    if (status === 429) {
+      res.set("Retry-After", String(e.retryAfterSec || 10));
+      return res.status(429).json({
+        error: "Rate limit exceeded",
+        analysisType: e.analysisType || "standard",
+        limitPerMin: e.limitPerMin || 0,
+        retryAfterSec: e.retryAfterSec || 10,
+      });
+    }
+    return res.status(status).json({ error: e.message || "IA11_ERROR" });
+  }
+});
+
+// Translate an already computed analysis WITHOUT new web search.
+// Input: { analysisData, targetLanguage }
+app.post("/translate-analysis", async (req, res) => {
+  try {
+    if (!authCheck(req, res)) return;
+
+    const { analysisData, targetLanguage } = req.body || {};
+    if (!analysisData || typeof analysisData !== "object") {
+      return res.status(400).json({ error: "analysisData required" });
+    }
+
+    const lang = (targetLanguage || "en").toLowerCase();
+    const fr = lang.startsWith("fr");
+
+    // Normalize shape: accept either {result:{...}} or already the result object
+    const root = analysisData.result ? analysisData : { analysisType: analysisData.analysisType, result: analysisData };
+    const result = root.result || {};
+
+    const analysisType = root.analysisType || result.analysisType || "pro";
+
+    // Copy and rebuild only the language-dependent strings
+    const translated = JSON.parse(JSON.stringify(root));
+
+    translated.analysisType = analysisType;
+    translated.result.analysisType = analysisType;
+
+    // Recompute label + summary in target language
+    const score = Number(result.score ?? 0);
+    translated.result.label = labelFromScore(lang, score);
+
+    if (analysisType === "pro") {
+      const strongRefute = !!result?.pro?.strongRefute;
+      translated.result.summary = fr
+        ? (strongRefute
+            ? "Sources fiables consultées : contradiction forte. Crédibilité très faible."
+            : "Analyse PRO basée sur preuves : sources consultées et justification détaillée.")
+        : (strongRefute
+            ? "Reliable sources consulted: strong contradiction. Very low credibility."
+            : "PRO evidence-based analysis: sources consulted and detailed justification.");
+
+      // Rebuild explanation if we have the pieces
+      const claim = result?.pro?.claim || "";
+      const evidenceScore = result?.pro?.evidenceScore ?? 45;
+      const confidence = Math.round((Number(result.confidence || 0.1) * 100));
+      const evidence = {
+        evidenceScore,
+        confidence,
+        strongRefute: !!result?.pro?.strongRefute,
+        notes: Array.isArray(result?.pro?.notes) ? result.pro.notes : [],
+      };
+      const buckets = result?.pro?.buckets || {
+        corroborates: result?.corroboration?.corroborates || [],
+        contradicts: result?.corroboration?.contradicts || [],
+        neutral: result?.corroboration?.neutral || [],
+      };
+
+      translated.result.pro.explanation = buildProExplanation(lang, claim, evidence, buckets);
+
+      // Breakdown reasons language
+      translated.result.breakdown = translated.result.breakdown || {};
+      translated.result.breakdown.sources = {
+        points: Number(translated.result.breakdown.sources?.points ?? Math.round(evidenceScore)),
+        reason: fr ? "Qualité/fiabilité des sources et cohérence." : "Source quality/reliability and coherence.",
+      };
+      translated.result.breakdown.factual = {
+        points: Number(translated.result.breakdown.factual?.points ?? Math.round(evidenceScore)),
+        reason: fr ? "Alignement avec des sources vérifiables." : "Alignment with verifiable sources.",
+      };
+      translated.result.breakdown.tone = {
+        points: Number(translated.result.breakdown.tone?.points ?? 60),
+        reason: fr ? "Prudence, formulations, signes d'exagération." : "Prudence, phrasing, exaggeration signals.",
+      };
+      translated.result.breakdown.context = {
+        points: Number(translated.result.breakdown.context?.points ?? 55),
+        reason: fr ? "Contexte et vérifiabilité." : "Context and verifiability.",
+      };
+      translated.result.breakdown.transparency = {
+        points: Number(translated.result.breakdown.transparency?.points ?? 70),
+        reason: fr ? "Méthode et limites expliquées." : "Method and limits stated.",
+      };
+    } else {
+      // Standard: keep the computed summary, just swap the PRO tease sentence if present
+      const base = String(result.summary || "");
+      const teaseFR = "PRO : preuves + sources + explication complète.";
+      const teaseEN = "PRO: evidence + sources + full explanation.";
+
+      if (fr) {
+        translated.result.summary = base.replace(teaseEN, teaseFR);
+      } else {
+        translated.result.summary = base.replace(teaseFR, teaseEN);
+      }
+
+      // Breakdown reasons language
+      translated.result.breakdown = translated.result.breakdown || {};
+      translated.result.breakdown.sources = {
+        points: Number(translated.result.breakdown.sources?.points ?? 0),
+        reason: fr ? "Standard : pas de liens affichés (tease PRO)." : "Standard: no links displayed (PRO tease).",
+      };
+      translated.result.breakdown.transparency = {
+        points: Number(translated.result.breakdown.transparency?.points ?? 60),
+        reason: fr ? "Guide de crédibilité, pas un verdict absolu." : "Credibility guidance, not an absolute verdict.",
+      };
+    }
+
+    return res.json({
+      status: "ok",
+      engine: "IA11 Ultra Pro",
+      analysisType: translated.analysisType,
+      result: translated.result,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "IA11_TRANSLATE_ERROR" });
+  }
+});
+
+// Screenshot / Image analysis (lightweight, no heavy OCR libs).
+// Input: { imageData, language, analysisType, contextText }
+// Output: { ocr:{cleaned_text}, image_signals:{...}, analysis:{...} }
+app.post("/analyze-image", async (req, res) => {
+  try {
+    if (!authCheck(req, res)) return;
+
+    const { imageData, language, analysisType, contextText } = req.body || {};
+
+    const cleaned = (contextText || "").toString().trim();
+
+    // Minimal signals (placeholders) — you can upgrade later with real CV/OCR.
+    const image_signals = {
+      screenshot_likelihood: "unknown",
+      compression_artifacts: "unknown",
+      font_consistency: "unknown",
+      metadata_flags: [],
+      manipulation_probability: "unknown",
+    };
+
+    const warning =
+      cleaned.length === 0
+        ? "OCR not enabled on IA11 yet. Provide contextText to run text-based analysis."
+        : null;
+
+    let analysis = null;
+
+    // If we have text context, we can produce a real analysis immediately.
+    if (cleaned.length > 0) {
+      const out = await analyzeCore(req, { content: cleaned, analysisType, language });
+      analysis = { analysisType: out.analysisType, result: out.result };
+    }
+
+    return res.json({
+      status: "ok",
+      engine: "IA11 Ultra Pro",
+      ocr: {
+        cleaned_text: cleaned,
+        raw_text: cleaned,
+      },
+      image_signals,
+      analysis,
+      warning,
+      visual_text_mismatch: null,
+      visual_description: null,
+    });
+  } catch (e) {
+    const status = e.httpStatus || 500;
+    if (status === 429) {
+      res.set("Retry-After", String(e.retryAfterSec || 10));
+      return res.status(429).json({
+        error: "Rate limit exceeded",
+        analysisType: e.analysisType || "standard",
+        limitPerMin: e.limitPerMin || 0,
+        retryAfterSec: e.retryAfterSec || 10,
+      });
+    }
+    return res.status(status).json({ error: e.message || "IA11_IMAGE_ERROR" });
+  }
+});
 
 // START SERVER
 const PORT = process.env.PORT || 3000;

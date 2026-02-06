@@ -360,6 +360,114 @@ function computeStandard(text, lang) {
     sources: [], // Standard = 0 sources web
   };
 }
+// ================= STANDARD: Mini "Reality Check" (1 Serper max) =================
+// Objectif: éviter qu’une absurdité factuelle ("Le Canada est une ville") sorte crédible en Standard.
+// - 1 requête Serper MAX
+// - pénalité claire si contradiction évidente
+async function runStandardRealityCheck(text, lang) {
+  // Si pas de clé Serper, on ne bloque pas le Standard (fallback sans web).
+  if (!SERPER_KEY) {
+    return { used: false, penalty: 0, note: "no_serper_key", sources: [] };
+  }
+
+  const query = buildStandardRealityQuery(text, lang);
+  if (!query) return { used: false, penalty: 0, note: "no_query", sources: [] };
+
+  const sr = await serperSearch(query, lang, 5);
+  if (!sr.ok) return { used: false, penalty: 0, note: "serper_error", sources: [] };
+
+  const items = (sr.items || []).slice(0, 5);
+  const evalOut = evaluateObviousContradiction(text, items, lang);
+
+  const sources = items.slice(0, 3).map((it) => ({
+    title: it.title,
+    url: it.link,
+    domain: getDomain(it.link),
+    snippet: it.snippet || "",
+  }));
+
+  return {
+    used: true,
+    penalty: evalOut.penalty,
+    verdict: evalOut.verdict,
+    note: evalOut.note,
+    query,
+    sources,
+  };
+}
+
+function buildStandardRealityQuery(text, lang) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  // Sujet (ex: "Canada" dans "Le Canada est ...")
+  const subject =
+    (t.match(/\b(?:le|la|l')\s*([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,})/i) || [])[1] ||
+    (t.match(/\b([A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,})\b/) || [])[1] ||
+    "";
+
+  const mentionsCity = /\b(ville|city)\b/i.test(t);
+  const mentionsCountry = /\b(pays|country)\b/i.test(t);
+
+  // Requête spéciale pour le cas "X est une ville/pays"
+  if (subject && (mentionsCity || mentionsCountry)) {
+    if (mentionsCity) {
+      return fr
+        ? `${subject} est une ville ou un pays`
+        : `${subject} is a city or a country`;
+    }
+    if (mentionsCountry) {
+      return fr
+        ? `${subject} est un pays ou une ville`
+        : `${subject} is a country or a city`;
+    }
+  }
+
+  // Fallback: on garde la phrase courte + intention "définition"
+  const short = t.length > 140 ? t.slice(0, 140) : t;
+  return fr ? `${short} définition` : `${short} definition`;
+}
+
+function evaluateObviousContradiction(text, items, lang) {
+  const t = (text || "").toLowerCase();
+
+  const claimCity = /\b(ville|city)\b/.test(t);
+  const claimCountry = /\b(pays|country)\b/.test(t);
+
+  // On lit titre + snippet des 3 premiers résultats
+  const top = (items || []).slice(0, 3).map((it) => `${it.title || ""} ${it.snippet || ""}`.toLowerCase()).join(" ");
+
+  const evidenceCity = /\b(ville|city|municipality|town)\b/.test(top);
+  const evidenceCountry = /\b(pays|country|sovereign|nation)\b/.test(top);
+
+  // Pénalité "contradiction évidente"
+  if (claimCity && evidenceCountry && !evidenceCity) {
+    return {
+      verdict: "contradiction",
+      penalty: 28,
+      note: "Claim says CITY, top sources describe COUNTRY.",
+    };
+  }
+
+  if (claimCountry && evidenceCity && !evidenceCountry) {
+    return {
+      verdict: "contradiction",
+      penalty: 28,
+      note: "Claim says COUNTRY, top sources describe CITY.",
+    };
+  }
+
+  // Sinon: petite pénalité si c’est une affirmation vérifiable (sans aller trop loin)
+  const verifiable = looksLikeVerifiableClaim(text);
+  if (verifiable) {
+    return { verdict: "uncertain", penalty: 6, note: "Verifiable claim: light risk penalty (Standard)." };
+  }
+
+  return { verdict: "none", penalty: 0, note: "No obvious contradiction detected." };
+}
 
 // ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
 
@@ -992,23 +1100,50 @@ app.post("/v1/analyze", async (req, res) => {
         });
       }
 
-    // STANDARD: 0 Serper
+     // STANDARD: 1 mini Serper (max) pour éviter les absurdités factuelles
     if (normalizedMode === "standard") {
       const standardOut = computeStandard(text, language);
+
+      // Mini "reality check" (1 recherche max) => pénalité si contradiction évidente
+      const reality = await runStandardRealityCheck(text, language);
+      const penalty = reality?.penalty || 0;
+
+      const adjustedScore = Math.max(0, Math.round(standardOut.score - penalty));
+
+      const l = (language || "en").toLowerCase();
+      const fr = l.startsWith("fr");
+
+      const extraLine = reality?.used
+        ? (reality.verdict === "contradiction"
+            ? (fr ? "Mini-vérification web: contradiction évidente détectée." : "Mini web check: obvious contradiction detected.")
+            : (fr ? "Mini-vérification web: aucun conflit évident (signal léger)." : "Mini web check: no obvious conflict (light signal)."))
+        : (fr ? "Mini-vérification web indisponible." : "Mini web check unavailable.");
+
+      const summary = `${standardOut.summary} ${extraLine}`;
 
       return res.json({
         status: "ok",
         engine: "IA11 Ultra Pro",
         result: {
           mode: "standard",
-          score: standardOut.score,
-          label: labelFromScore(language, standardOut.score),
-          summary: standardOut.summary,
-          sources: [], // Standard = aucun lien web
-          standard: standardOut.standard,
+          score: adjustedScore,
+          label: labelFromScore(language, adjustedScore),
+          summary,
+          // Standard: on montre seulement quelques liens (si utilisés) pour guider sans faire un PRO déguisé
+          sources: (reality?.sources || []).slice(0, 3),
+          standard: {
+            ...standardOut.standard,
+            realityCheck: {
+              used: !!reality?.used,
+              penaltyApplied: penalty,
+              verdict: reality?.verdict || null,
+              query: reality?.query || null,
+            },
+          },
         },
       });
     }
+
 
     // PRO: nécessite Serper
     if (!SERPER_KEY)

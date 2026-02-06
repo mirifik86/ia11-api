@@ -1323,14 +1323,14 @@ app.post("/v1/analyze", async (req, res) => {
       return res.status(500).json({ error: "Missing SERPER_API_KEY" });
 
     const writingScore = computeWritingScore(text);
-    const verifiable = looksLikeVerifiableClaim(proSearch?.claim || text);
-
 
     const proSearch = await runProEvidence(text, language);
 
-    const evidenceScore = proSearch.evidence.evidenceScore;
-    const confidence = proSearch.evidence.confidence;
-    const strongRefute = proSearch.evidence.strongRefute;
+    const verifiable = looksLikeVerifiableClaim(proSearch?.claim || text);
+
+    const evidenceScore = proSearch?.evidence?.evidenceScore ?? 45;
+    const confidence = proSearch?.evidence?.confidence ?? 10;
+    const strongRefute = proSearch?.evidence?.strongRefute ?? false;
 
     const finalScore = computeProFinalScore(
       text,

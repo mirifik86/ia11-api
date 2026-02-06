@@ -402,19 +402,32 @@ function synonymMapToken(tok, lang) {
   const l = (lang || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
-  if (fr) {
-    if (t === "au-dessus" || t === "dessus") return "nord";
-    if (t === "nord" || t === "nordest" || t === "nord-ouest") return "nord";
-    if (t === "etats" || t === "etat" || t === "unis" || t === "américains" || t === "americains") return "usa";
-    if (t === "états" || t === "état") return "usa";
-    if (t === "amérique" || t === "amerique") return "amerique";
-  } else {
-    if (t === "above" || t === "over") return "north";
-    if (t === "north" || t === "northern") return "north";
-    if (t === "united" || t === "states" || t === "america" || t === "american") return "usa";
-  }
+  // === Ultra Pro: synonymes "sens" (FR/EN) ===
+  // Ville
+  if (t === "city" || t === "town") return "ville";
+  if (t === "ville") return "ville";
+
+  // Pays
+  if (t === "country") return "pays";
+  if (t === "pays") return "pays";
+
+  // États-Unis / USA
+  if (t === "united" || t === "states" || t === "america" || t === "american") return "usa";
+  if (t === "etats" || t === "etat" || t === "unis" || t === "américains" || t === "americains") return "usa";
+  if (t === "états" || t === "état") return "usa";
+
+  // Nord (petit bonus utile)
+  if (t === "above" || t === "over") return "north";
+  if (t === "north" || t === "northern") return "north";
+  if (t === "au-dessus" || t === "dessus") return "nord";
+  if (t === "nord" || t === "nordest" || t === "nord-ouest") return "nord";
+
+  // Amérique
+  if (t === "amérique" || t === "amerique") return "amerique";
+
   return t;
 }
+
 
 function purgeExpiredProCache() {
   const now = Date.now();
@@ -526,7 +539,14 @@ function jaccardSimilarity(aSet, bSet) {
   for (const x of aSet) if (bSet.has(x)) inter++;
 
   const union = a + b - inter;
-  return union <= 0 ? 0 : inter / union;
+  const base = union <= 0 ? 0 : inter / union;
+
+  // Ultra Pro boost: si le "noyau" (top tokens) est identique, on pousse le score
+  const coreA = Array.from(aSet).sort().slice(0, 2).join("|");
+  const coreB = Array.from(bSet).sort().slice(0, 2).join("|");
+  if (coreA && coreA === coreB) return Math.min(1, base + 0.25);
+
+  return base;
 }
 
 // Option C: sens + garde-fous + mini-Serper si borderline

@@ -330,96 +330,170 @@ function computeWritingScore(text) {
 }
 
 function computeStandard(text, lang) {
+  // Option B (optimisée) = 70% qualité du texte + 30% mini reality-check (1 Serper max)
   const writingScore = computeWritingScore(text);
+
   const providedSources = hasUserProvidedSources(text);
-  const verifiable = looksLikeVerifiableClaim(text);
+  const claims = extractStandardClaims(text, lang, 6);
+  const claimToCheck = pickPriorityClaim(claims, lang);
 
-  // Risque factuel (wow: clair et assumé)
-  let factualRisk = "Low";
-  if (verifiable && !providedSources) factualRisk = "High";
-  else if (verifiable) factualRisk = "Medium";
-
-  // Score final Standard = brutal si fait vérifiable sans source
-  let final = writingScore;
+  // Petit frein “conversion PRO” : si le texte contient des affirmations vérifiables sans sources,
+  // on réduit légèrement le plafond (sans massacrer le score, car le reality-check va trancher sur 1 claim).
+  const verifiableOverall = looksLikeVerifiableClaim(text);
+  let textScore = writingScore;
 
   let cap = 100;
   let capReason = null;
 
-  if (factualRisk === "High") {
-    cap = 35;
-    capReason = "Verifiable factual claim without any provided source.";
-  } else if (factualRisk === "Medium") {
-    cap = 55;
-    capReason = "Verifiable claim with limited/unclear sourcing.";
+  if (verifiableOverall && !providedSources) {
+    cap = 75;
+    capReason = "Verifiable claims detected without any source provided in the text (Standard stays cautious).";
+  } else if (verifiableOverall) {
+    cap = 85;
+    capReason = "Verifiable claims detected with limited/unclear sourcing (Standard stays cautious).";
   }
 
-  final = Math.min(final, cap);
+  textScore = Math.max(0, Math.min(cap, Math.round(textScore)));
 
   const l = (lang || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
+  // Résumé Standard = utile mais volontairement incomplet (tease PRO)
   const summary = fr
-    ? (factualRisk === "High"
-        ? "Affirmation vérifiable sans preuve fournie. Score Standard volontairement sévère."
-        : "Analyse Standard : formulation + risque de crédibilité (sans vérification web).")
-    : (factualRisk === "High"
-        ? "Verifiable claim without proof provided. Standard score is intentionally strict."
-        : "Standard analysis: writing + credibility risk (no web verification).");
+    ? "Analyse Standard : cohérence du texte + signaux de crédibilité. Vérification web minimale (1 seul point) pour éviter les absurdités factuelles."
+    : "Standard analysis: text coherence + credibility signals. Minimal web check (single point) to avoid obvious factual nonsense.";
+
+  const positives = buildStandardPositives(text, lang);
+  const risks = buildStandardRisks(text, lang);
+  const missing = buildStandardMissingInfo(text, lang, providedSources);
+
+  const proTease = fr
+    ? "PRO (2,99$) : plusieurs affirmations vérifiées, preuves/sources, et justification complète."
+    : "PRO ($2.99): multiple claims checked, evidence/sources, and a full justification.";
 
   return {
-    score: final,
+    textScore,
     summary,
+    bullets: { positives, risks, missing, proTease },
     standard: {
       writingScore,
-      factualRisk: fr ? (factualRisk === "High" ? "Élevé" : factualRisk === "Medium" ? "Moyen" : "Faible") : factualRisk,
       capApplied: cap,
       capReason: capReason
         ? (fr
-            ? "Affirmation hautement vérifiable sans source dans le texte. Standard = formulation + risque, pas les faits."
-            : "Highly verifiable claim with no source in text. Standard = writing + risk, not factual verification.")
+            ? "Des affirmations vérifiables semblent présentes, mais les sources ne sont pas fournies clairement. Standard reste prudent."
+            : "Verifiable claims seem present, but sources are not clearly provided. Standard stays cautious.")
         : null,
+      claimsExtracted: claims.slice(0, 6),
+      claimToCheck: claimToCheck || null,
     },
-    sources: [], // Standard = 0 sources web
   };
 }
-// ================= STANDARD: Mini "Reality Check" (1 Serper max) =================
-// Objectif: éviter qu’une absurdité factuelle ("Le Canada est une ville") sorte crédible en Standard.
-// - 1 requête Serper MAX
-// - pénalité claire si contradiction évidente
-async function runStandardRealityCheck(text, lang) {
-  // Si pas de clé Serper, on ne bloque pas le Standard (fallback sans web).
-  if (!SERPER_KEY) {
-    return { used: false, penalty: 0, note: "no_serper_key", sources: [] };
+
+// ---------------- STANDARD: Claims (3–6) + 1 mini Reality Check ----------------
+
+function extractStandardClaims(text, lang, maxClaims = 6) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return [];
+
+  // Découpage très simple (robuste + cheap)
+  const raw = t
+    .split(/(?<=[\.\!\?])\s+|\n+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // Filtre: on garde les phrases "affirmatives" (verifiables / structurées)
+  const out = [];
+  const seen = new Set();
+
+  for (const s of raw) {
+    if (out.length >= maxClaims * 2) break; // marge avant tri
+
+    const short = s.length > 220 ? s.slice(0, 220) : s;
+    const key = safeLower(short).replace(/[^a-z0-9à-öø-ÿ]+/gi, " ").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+
+    const hasNumber = /\b\d{1,4}\b/.test(short);
+    const hasProper = /\b[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,}\b/.test(short);
+    const hasCopula = /\b(est|sont|était|étaient|is|are|was|were|become|devient|représente)\b/i.test(short);
+    const hasGeo = /\b(ville|city|pays|country|capitale|capital|province|state)\b/i.test(short);
+
+    const keep = hasCopula || hasNumber || (hasProper && hasGeo);
+    if (keep) out.push(short);
   }
 
-  const query = buildStandardRealityQuery(text, lang);
-  if (!query) return { used: false, penalty: 0, note: "no_query", sources: [] };
+  // Si trop peu, on prend quand même les premières phrases
+  if (out.length < 3) {
+    for (const s of raw) {
+      if (out.length >= 3) break;
+      const short = s.length > 220 ? s.slice(0, 220) : s;
+      if (!out.includes(short)) out.push(short);
+    }
+  }
+
+  // Tri: les plus “vérifiables” en premier
+  const scored = out.map((s) => ({ s, score: scoreClaimVerifiability(s) }));
+  scored.sort((a, b) => b.score - a.score);
+
+  return scored.slice(0, maxClaims).map((x) => x.s);
+}
+
+function scoreClaimVerifiability(sentence) {
+  const s = sentence || "";
+  let score = 0;
+
+  if (/\b\d{1,4}\b/.test(s)) score += 18;
+  if (/\b[A-ZÀ-ÖØ-Ý][\wÀ-ÖØ-öø-ÿ'-]{2,}\b/.test(s)) score += 12;
+  if (/\b(ville|city|pays|country|capitale|capital|province|state)\b/i.test(s)) score += 14;
+  if (/\b(est|sont|is|are|was|were)\b/i.test(s)) score += 10;
+
+  // Très “simple et vérifiable” => priorité
+  if (/\b(ville|city)\b/i.test(s) && /\b(pays|country)\b/i.test(s)) score += 10;
+
+  // Trop long = moins bon pour une requête Serper
+  if (s.length > 180) score -= 8;
+
+  return score;
+}
+
+function pickPriorityClaim(claims, lang) {
+  if (!Array.isArray(claims) || claims.length === 0) return null;
+
+  // On prend déjà trié par verifiability — mais on pousse les cas “ville/pays” en priorité
+  const boosted = claims
+    .map((c) => ({ c, boost: (/\b(ville|city)\b/i.test(c) && /\b(pays|country)\b/i.test(c)) ? 25 : 0 }))
+    .sort((a, b) => b.boost - a.boost);
+
+  return boosted[0]?.c || claims[0] || null;
+}
+
+async function runStandardRealityCheck(text, lang, claimToCheck) {
+  // Si pas de clé Serper, on ne bloque pas le Standard (fallback sans web).
+  if (!SERPER_KEY) {
+    return { used: false, verdict: "unavailable", realityScore: 55, note: "no_serper_key", checkedClaim: claimToCheck || null };
+  }
+
+  const query = buildStandardRealityQuery(text, lang, claimToCheck);
+  if (!query) return { used: false, verdict: "unavailable", realityScore: 55, note: "no_query", checkedClaim: claimToCheck || null };
 
   const sr = await serperSearch(query, lang, 5);
-  if (!sr.ok) return { used: false, penalty: 0, note: "serper_error", sources: [] };
+  if (!sr.ok) return { used: false, verdict: "unavailable", realityScore: 55, note: "serper_error", checkedClaim: claimToCheck || null };
 
   const items = (sr.items || []).slice(0, 5);
-  const evalOut = evaluateObviousContradiction(text, items, lang);
-
-  const sources = items.slice(0, 3).map((it) => ({
-    title: it.title,
-    url: it.link,
-    domain: getDomain(it.link),
-    snippet: it.snippet || "",
-  }));
+  const evalOut = evaluateStandardReality(claimToCheck || text, items, lang);
 
   return {
     used: true,
-    penalty: evalOut.penalty,
     verdict: evalOut.verdict,
+    realityScore: evalOut.realityScore,
     note: evalOut.note,
+    checkedClaim: claimToCheck || null,
     query,
-    sources,
   };
 }
 
-function buildStandardRealityQuery(text, lang) {
-  const t = (text || "").replace(/\s+/g, " ").trim();
+function buildStandardRealityQuery(text, lang, claimToCheck) {
+  const t = (claimToCheck || text || "").replace(/\s+/g, " ").trim();
   if (!t) return null;
 
   const l = (lang || "en").toLowerCase();
@@ -448,47 +522,86 @@ function buildStandardRealityQuery(text, lang) {
     }
   }
 
-  // Fallback: on garde la phrase courte + intention "définition"
+  // Requête “fact check” courte
   const short = t.length > 140 ? t.slice(0, 140) : t;
-  return fr ? `${short} définition` : `${short} definition`;
+  return fr ? `${short} vérification` : `${short} fact check`;
 }
 
-function evaluateObviousContradiction(text, items, lang) {
-  const t = (text || "").toLowerCase();
+function evaluateStandardReality(claimText, items, lang) {
+  const t = (claimText || "").toLowerCase();
 
   const claimCity = /\b(ville|city)\b/.test(t);
   const claimCountry = /\b(pays|country)\b/.test(t);
 
-  // On lit titre + snippet des 3 premiers résultats
+  // Titre + snippet des 3 premiers résultats
   const top = (items || []).slice(0, 3).map((it) => `${it.title || ""} ${it.snippet || ""}`.toLowerCase()).join(" ");
 
   const evidenceCity = /\b(ville|city|municipality|town)\b/.test(top);
   const evidenceCountry = /\b(pays|country|sovereign|nation)\b/.test(top);
 
-  // Pénalité "contradiction évidente"
+  // Contradiction évidente => realityScore très bas (objectif : score final ~10–15 si le texte se trompe gros)
   if (claimCity && evidenceCountry && !evidenceCity) {
     return {
       verdict: "contradiction",
-      penalty: 28,
-      note: "Claim says CITY, top sources describe COUNTRY.",
+      realityScore: 5,
+      note: "Claim suggests CITY; top results describe COUNTRY.",
     };
   }
 
   if (claimCountry && evidenceCity && !evidenceCountry) {
     return {
       verdict: "contradiction",
-      penalty: 28,
-      note: "Claim says COUNTRY, top sources describe CITY.",
+      realityScore: 5,
+      note: "Claim suggests COUNTRY; top results describe CITY.",
     };
   }
 
-  // Sinon: petite pénalité si c’est une affirmation vérifiable (sans aller trop loin)
-  const verifiable = looksLikeVerifiableClaim(text);
+  // Si c’est vérifiable, mais pas de contradiction claire => moyen (on reste prudent)
+  const verifiable = looksLikeVerifiableClaim(claimText);
   if (verifiable) {
-    return { verdict: "uncertain", penalty: 6, note: "Verifiable claim: light risk penalty (Standard)." };
+    return { verdict: "uncertain", realityScore: 45, note: "Verifiable claim: no obvious contradiction, but not fully proven in Standard." };
   }
 
-  return { verdict: "none", penalty: 0, note: "No obvious contradiction detected." };
+  // Sinon: rien à checker => plutôt neutre
+  return { verdict: "none", realityScore: 70, note: "No obvious contradiction detected." };
+}
+
+// ----------- Small helpers for Standard bullets (teasing PRO) -----------
+
+function buildStandardPositives(text, lang) {
+  const t = (text || "").trim();
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  const out = [];
+  if (t.length >= 80) out.push(fr ? "Le texte est suffisamment développé pour être évalué." : "Text is sufficiently developed to evaluate.");
+  if (/\b(selon|peut-être|probablement|à ce stade|it seems|maybe|likely|according to)\b/i.test(t)) out.push(fr ? "Présence de nuances (prudence dans le ton)." : "Nuanced tone (some caution/hedging).");
+  if (hasUserProvidedSources(t)) out.push(fr ? "Des liens/sources semblent être fournis dans le texte." : "Some sources/links appear to be provided in the text.");
+  return out.slice(0, 3);
+}
+
+function buildStandardRisks(text, lang) {
+  const t = (text || "").trim();
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  const out = [];
+  if (/\b(toujours|jamais|100%|certain|preuve ultime|obvious|everyone knows)\b/i.test(t)) out.push(fr ? "Ton trop absolu (signal de manipulation possible)." : "Overly absolute tone (possible manipulation signal).");
+  if (/\b(ville|city|pays|country|capitale|capital)\b/i.test(t) && !hasUserProvidedSources(t)) out.push(fr ? "Affirmations factuelles sans source claire." : "Factual claims without clear sourcing.");
+  if (t.length < 35) out.push(fr ? "Texte très court : risque d’interprétation." : "Very short text: higher interpretation risk.");
+  return out.slice(0, 3);
+}
+
+function buildStandardMissingInfo(text, lang, providedSources) {
+  const t = (text || "").trim();
+  const l = (lang || "en").toLowerCase();
+  const fr = l.startsWith("fr");
+
+  const out = [];
+  if (!providedSources) out.push(fr ? "Une ou deux sources fiables (lien) aideraient beaucoup." : "One or two reliable sources (links) would help a lot.");
+  if (!/\b\d{1,4}\b/.test(t)) out.push(fr ? "Des faits précis (dates/chiffres) rendraient l’affirmation plus vérifiable." : "Precise facts (dates/numbers) would make claims more verifiable.");
+  out.push(fr ? "PRO : vérifie plusieurs affirmations et fournit des preuves." : "PRO: checks multiple claims and provides evidence.");
+  return out.slice(0, 3);
 }
 
 // ---------------- PRO (1 à 3 Serper max) : dictature de la preuve + sources cliquables ----------------
@@ -1296,44 +1409,51 @@ app.post("/v1/analyze", async (req, res) => {
         });
       }
 
-     // STANDARD: 1 mini Serper (max) pour éviter les absurdités factuelles
+        // STANDARD: Option B optimisée (70% texte + 30% mini reality-check 1 Serper)
     if (normalizedMode === "standard") {
       const standardOut = computeStandard(text, language);
 
-      // Mini "reality check" (1 recherche max) => pénalité si contradiction évidente
-      const reality = await runStandardRealityCheck(text, language);
-      const penalty = reality?.penalty || 0;
+      // 1 seul mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
+      const reality = await runStandardRealityCheck(text, language, standardOut?.standard?.claimToCheck);
+      const realityScore = typeof reality?.realityScore === "number" ? reality.realityScore : 55;
 
-      const adjustedScore = Math.max(0, Math.round(standardOut.score - penalty));
+      const finalScore = Math.max(
+        0,
+        Math.min(
+          100,
+          Math.round(0.7 * (standardOut.textScore || 0) + 0.3 * realityScore)
+        )
+      );
 
       const l = (language || "en").toLowerCase();
       const fr = l.startsWith("fr");
 
-      const extraLine = reality?.used
-        ? (reality.verdict === "contradiction"
-            ? (fr ? "Mini-vérification web: contradiction évidente détectée." : "Mini web check: obvious contradiction detected.")
-            : (fr ? "Mini-vérification web: aucun conflit évident (signal léger)." : "Mini web check: no obvious conflict (light signal)."))
-        : (fr ? "Mini-vérification web indisponible." : "Mini web check unavailable.");
-
-      const summary = `${standardOut.summary} ${extraLine}`;
+      // Résumé neutre + tease PRO (pas de sources, pas de verdict absolu)
+      const summary = `${standardOut.summary} ${standardOut?.bullets?.proTease || (fr ? "PRO : preuves + sources + explication complète." : "PRO: evidence + sources + full explanation.")}`;
 
       return res.json({
         status: "ok",
         engine: "IA11 Ultra Pro",
         result: {
           mode: "standard",
-          score: adjustedScore,
-          label: labelFromScore(language, adjustedScore),
+          score: finalScore,
+          label: labelFromScore(language, finalScore),
           summary,
-          // Standard: on montre seulement quelques liens (si utilisés) pour guider sans faire un PRO déguisé
-          sources: (reality?.sources || []).slice(0, 3),
+          // IMPORTANT: Standard ne montre PAS de sources (ça reste un tease PRO)
+          sources: [],
           standard: {
-            ...standardOut.standard,
-            realityCheck: {
-              used: !!reality?.used,
-              penaltyApplied: penalty,
-              verdict: reality?.verdict || null,
-              query: reality?.query || null,
+            textScore: standardOut.textScore,
+            realityScore,
+            // mini blocs UI pour Lovable (résumé + faim du PRO)
+            bullets: standardOut.bullets,
+            // infos techniques (tu peux garder/masquer côté UI)
+            details: {
+              writingScore: standardOut?.standard?.writingScore,
+              capApplied: standardOut?.standard?.capApplied,
+              capReason: standardOut?.standard?.capReason,
+              claimChecked: reality?.checkedClaim || standardOut?.standard?.claimToCheck || null,
+              realityVerdict: reality?.verdict || null,
+              realityUsed: !!reality?.used,
             },
           },
         },

@@ -460,7 +460,26 @@ function buildProSimilarityProfile(text, lang) {
   const l = (lang || "en").toLowerCase();
   const fr = l.startsWith("fr");
   // Stopwords combinés + mots génériques fréquents qui polluent la similarité
-const stop = new Set([...STOP_FR, ...STOP_EN, "est", "des", "plus", "situe", "situé", "situer", "america", "amerique", "amérique"]);
+  const stop = new Set([
+    ...STOP_FR,
+    ...STOP_EN,
+
+  // bruit générique
+  "est", "des", "plus",
+  "situe", "situé", "situer",
+  "america", "amerique", "amérique",
+
+  // adjectifs “décoratifs” qui ne doivent pas coûter des crédits Serper
+  // FR
+  "gros","grosse","grand","grande","petit","petite",
+  "enorme","énorme","immense","gigantesque",
+  "grosser","petiter", // au cas où (fautes)
+  "grands","grandes","petits","petites","grosses",
+
+  // EN
+  "big","small","large","huge","tiny","massive","giant"
+]);
+
 
 
   const cleaned = safeLower(text || "")

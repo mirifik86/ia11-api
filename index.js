@@ -1049,6 +1049,8 @@ function scoreEvidenceBrutal(enrichedItems, verifiable) {
 }
 
 async function runProEvidence(text, lang) {
+    try {
+
     // Le claim (le coeur du fact-check)
   const claim = extractMainClaim(text);
 
@@ -1210,6 +1212,27 @@ async function runProEvidence(text, lang) {
       ? null
       : (isBorderline ? { tier: "borderline-mini", score: hit.score, matchedKey: hit.matchedKey } : null)
   };
+    } catch (err) {
+    console.error("runProEvidence crash:", err);
+
+    return {
+      ok: false,
+      claim: extractMainClaim(text),
+      queriesUsed: [],
+      items: [],
+      buckets: { corroborates: [], contradicts: [], neutral: [] },
+      evidence: {
+        evidenceScore: 45,
+        confidence: 10,
+        hasContradictions: false,
+        strongRefute: false,
+        strongSupport: false,
+        notes: ["runProEvidence_crash"],
+      },
+      error: err?.message || "runProEvidence_crash",
+    };
+  }
+
 }
 
 function computeProFinalScore(text, lang, writingScore, evidenceScore, strongRefute, verifiable) {

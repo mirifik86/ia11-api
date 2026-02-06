@@ -1048,18 +1048,17 @@ function scoreEvidenceBrutal(enrichedItems, verifiable) {
   return { evidenceScore, confidence, hasContradictions, strongRefute, strongSupport, notes };
 }
 
-}
-
 async function runProEvidence(text, lang) {
- // 🔑 Similarité basée sur le texte utilisateur complet (pas sur le claim)
-const rawTextForCache = (text || "").slice(0, 500);
+    // Le claim (le coeur du fact-check)
+  const claim = extractMainClaim(text);
 
-// Cache & similarité AVANT extraction du claim
-const cacheKey = normalizeClaimForCache(rawTextForCache, lang);
-const profile = buildProSimilarityProfile(rawTextForCache, lang);
+  // Verifiable = on doit être strict (capitale, dates, chiffres, etc.)
+  const verifiable = looksLikeVerifiableClaim(claim || text);
 
-// Le claim reste utilisé pour l’analyse finale
-const claim = extractMainClaim(text);
+  // Cache basé sur le claim (pas sur le texte complet)
+  const rawForCache = (claim || text || "").slice(0, 500);
+  const cacheKey = normalizeClaimForCache(rawForCache, lang);
+  const profile = buildProSimilarityProfile(rawForCache, lang);
 
 
   // 1) lookup cache (exact -> similar -> borderline)
@@ -1162,7 +1161,8 @@ const claim = extractMainClaim(text);
     else buckets.neutral.push(it);
   }
 
-  const evidence = scoreEvidenceBrutal(enriched);
+   const evidence = scoreEvidenceBrutal(enriched, verifiable);
+
 
   const payload = {
     ok: okCount > 0,
@@ -1321,7 +1321,8 @@ app.post("/v1/analyze", async (req, res) => {
       return res.status(500).json({ error: "Missing SERPER_API_KEY" });
 
     const writingScore = computeWritingScore(text);
-    const verifiable = looksLikeVerifiableClaim(text);
+    const verifiable = looksLikeVerifiableClaim(proSearch?.claim || text);
+
 
     const proSearch = await runProEvidence(text, language);
 

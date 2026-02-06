@@ -40,6 +40,9 @@ if (typeof _fetch !== "function") {
 // ENV
 const IA11_KEY = process.env.IA11_API_KEY;
 const SERPER_KEY = process.env.SERPER_API_KEY;
+const HTTP_TIMEOUT_MS = Number.parseInt(process.env.HTTP_TIMEOUT_MS || "8000", 10);
+const MAX_SERPER_QUERIES_ENV = Number.parseInt(process.env.MAX_SERPER_QUERIES || "4", 10);
+const SIMILARITY_STRICT_MODE = String(process.env.SIMILARITY_STRICT_MODE || "false").toLowerCase() === "true";
 
 // =====================
 // RATE LIMIT (RAM) — simple & efficace
@@ -96,6 +99,9 @@ app.get("/", (req, res) => {
 async function serperSearch(query, lang, num = 5) {
   console.log("🔎 SERPER QUERY:", query);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+
   try {
     const r = await _fetch("https://google.serper.dev/search", {
       method: "POST",
@@ -103,20 +109,23 @@ async function serperSearch(query, lang, num = 5) {
         "X-API-KEY": SERPER_KEY,
         "Content-Type": "application/json",
       },
-      // "num" est optionnel: si Serper le supporte, ça réduit volume/cout.
       body: JSON.stringify({ q: query, gl: "us", hl: lang || "en", num }),
+      signal: controller.signal,
     });
 
     const j = await r.json();
-
     console.log("📥 SERPER RESULTS:", (j.organic || []).length);
 
     return { ok: true, items: (j.organic || []).slice(0, Math.max(1, num)) };
   } catch (e) {
-    console.log("❌ SERPER ERROR:", e.message);
-    return { ok: false, error: e.message };
+    const msg = e?.name === "AbortError" ? `timeout after ${HTTP_TIMEOUT_MS}ms` : (e?.message || "unknown error");
+    console.log("❌ SERPER ERROR:", msg);
+    return { ok: false, error: msg };
+  } finally {
+    clearTimeout(timer);
   }
 }
+
 
 
 
@@ -535,9 +544,9 @@ function proCacheLookupBySimilarity(claim, lang, exactKey, profile) {
 
   if (!best) return { hit: false };
 
-  // Seuils (FR-friendly)
-  const HIGH = 0.74; // réutiliser sans Serper
-  const MID = 0.60;  // borderline -> mini Serper
+    const HIGH = SIMILARITY_STRICT_MODE ? 0.80 : 0.74; // plus strict = moins de faux "cache hit"
+    const MID  = SIMILARITY_STRICT_MODE ? 0.68 : 0.60; // borderline plus rare
+
 
   if (best.score >= HIGH) {
     return { hit: true, tier: "similar", payload: best.payload, matchedKey: best.key, score: best.score };
@@ -778,8 +787,10 @@ const claim = extractMainClaim(text);
   let lastError = null;
 
   // SAFE: si OFF, on force le comportement “normal” (3 requêtes / 5 résultats)
-  const maxQueries = (SIM_CACHE_MODE === "off") ? 3 : (isBorderline ? 1 : 3);
+  const baseMax = Math.max(1, Math.min(8, MAX_SERPER_QUERIES_ENV || 4));
+  const maxQueries = (SIM_CACHE_MODE === "off") ? 3 : (isBorderline ? 1 : baseMax);
   const numPerQuery = (SIM_CACHE_MODE === "off") ? 5 : (isBorderline ? 3 : 5);
+
 
   if (SIM_CACHE_MODE === "debug") {
     console.log("🧠 SERPER PLAN:", { isBorderline, maxQueries, numPerQuery, queriesPreview: queries.slice(0, 3) });

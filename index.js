@@ -223,7 +223,7 @@ function hasUserProvidedSources(text) {
   );
 }
 
-function looksLikeVerifiableClaim(text) {
+  function looksLikeVerifiableClaim(text) {
   const t = safeLower(text);
 
   // Indices simples de “fait vérifiable”
@@ -231,6 +231,7 @@ function looksLikeVerifiableClaim(text) {
   const hasYear = /\b(19\d{2}|20\d{2})\b/.test(t);
 
   const highRiskKeywords = [
+    // postes / politique
     "président",
     "president",
     "premier ministre",
@@ -251,6 +252,19 @@ function looksLikeVerifiableClaim(text) {
     "mayor",
     "ceo",
     "pdg",
+
+    // faits “durs” fréquents
+    "capitale",
+    "capital",
+    "population",
+    "habitants",
+    "gdp",
+    "pib",
+    "superficie",
+    "area",
+    "date",
+    "année",
+    "year",
   ];
 
   const verbFact = [
@@ -270,14 +284,22 @@ function looksLikeVerifiableClaim(text) {
   const kwHit = highRiskKeywords.some((k) => t.includes(k));
   const verbHit = verbFact.some((v) => t.includes(v));
 
-  // Si c’est court + contient structure factuelle → vérifiable
-  if (t.length < 220 && (kwHit || hasNumbers || hasYear) && verbHit) return true;
+  // Patterns “capitale / capital of” même sans mots-clés “poste”
+  const capitalPattern =
+    /\bcapitale\b/.test(t) ||
+    /\bcapital\b/.test(t) ||
+    /\bcapital\s+of\b/.test(t) ||
+    /\bcapitale\s+(du|de la|de l'|des)\b/.test(t);
 
-  // Même si plus long, si mots “poste officiel” + verbes factuels
-  if (kwHit && verbHit) return true;
+  // Si c’est court + contient structure factuelle → vérifiable
+  if (t.length < 220 && (kwHit || hasNumbers || hasYear || capitalPattern) && verbHit) return true;
+
+  // Même si plus long, si mots “fait dur” + verbes factuels
+  if ((kwHit || capitalPattern) && verbHit) return true;
 
   return false;
 }
+
 
 function computeWritingScore(text) {
   const t = (text || "").trim();
@@ -714,7 +736,8 @@ function extractMainClaim(text) {
   return (parts[0] || t).trim().slice(0, 240);
 }
 
-function stanceFromText(snippetOrTitle) {
+  function stanceFromText(snippetOrTitle) {
+  // Fallback (quand on ne peut pas comparer au claim)
   const s = safeLower(snippetOrTitle);
 
   const refuteWords = [
@@ -737,6 +760,142 @@ function stanceFromText(snippetOrTitle) {
   if (support > refute) return "support";
   return "unknown";
 }
+
+function stripDiacritics(s) {
+  return (s || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function normText(s) {
+  return stripDiacritics(s)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeEntityName(s) {
+  return normText(s)
+    .replace(/\b(the|a|an|la|le|les|l|de|du|des|of)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenSetFromText(s) {
+  const toks = normText(s).split(" ").filter((t) => t.length >= 3);
+  return new Set(toks);
+}
+
+function overlapCount(setA, setB) {
+  let c = 0;
+  for (const t of setA) if (setB.has(t)) c++;
+  return c;
+}
+
+// Détecte une claim de type “X est la capitale du/de Y” ou “X is the capital of Y”
+function extractCapitalClaimParts(claim) {
+  const raw = (claim || "").trim();
+  if (!raw) return null;
+
+  // FR
+  const fr = raw.match(/^(.*?)\s+(est|serait)\s+(la\s+)?capitale\s+(du|de la|de l'|des)\s+(.*)$/i);
+  if (fr) {
+    const city = fr[1].trim();
+    const country = fr[5].trim();
+    if (city && country) return { city, country, lang: "fr" };
+  }
+
+  // EN
+  const en = raw.match(/^(.*?)\s+(is|was|would be)\s+(the\s+)?capital\s+of\s+(.*)$/i);
+  if (en) {
+    const city = en[1].trim();
+    const country = en[4].trim();
+    if (city && country) return { city, country, lang: "en" };
+  }
+
+  return null;
+}
+
+// Extrait “la capitale de X est Y” / “capital of X is Y”
+function extractCapitalFromSnippet(snippet) {
+  const s = (snippet || "").replace(/\s+/g, " ").trim();
+  if (!s) return null;
+
+  // EN: "The capital of Canada is Ottawa"
+  let m = s.match(/capital\s+of\s+([^.,;:()\n]+?)\s+(is|was)\s+([^.,;:()\n]+)/i);
+  if (m) return { country: m[1].trim(), capital: m[3].trim() };
+
+  // EN: "Ottawa is the capital of Canada"
+  m = s.match(/([^.,;:()\n]+?)\s+(is|was)\s+(the\s+)?capital\s+of\s+([^.,;:()\n]+)/i);
+  if (m) return { capital: m[1].trim(), country: m[4].trim() };
+
+  // FR: "La capitale du Canada est Ottawa"
+  m = s.match(/capitale\s+(du|de la|de l'|des)\s+([^.,;:()\n]+?)\s+est\s+([^.,;:()\n]+)/i);
+  if (m) return { country: m[2].trim(), capital: m[3].trim() };
+
+  // FR: "Ottawa est la capitale du Canada"
+  m = s.match(/([^.,;:()\n]+?)\s+est\s+(la\s+)?capitale\s+(du|de la|de l'|des)\s+([^.,;:()\n]+)/i);
+  if (m) return { capital: m[1].trim(), country: m[5].trim() };
+
+  return null;
+}
+
+/**
+ * Compare un résultat web au claim.
+ * Retourne un stance *contre le claim*, pas juste “mots positifs/négatifs”.
+ */
+function classifyItemAgainstClaim(claim, title, snippet, lang) {
+  const combined = `${title || ""} ${snippet || ""}`.trim();
+
+  const claimTokens = tokenSetFromText(claim);
+  const itemTokens = tokenSetFromText(combined);
+
+  const ov = overlapCount(claimTokens, itemTokens);
+
+  // Relevance simple (0..100)
+  let relevance = 25;
+  if (ov >= 6) relevance = 95;
+  else if (ov >= 4) relevance = 80;
+  else if (ov >= 2) relevance = 60;
+  else if (ov >= 1) relevance = 45;
+
+  // 1) Cas capital/capitale (critique)
+  const cap = extractCapitalClaimParts(claim);
+  if (cap) {
+    const found = extractCapitalFromSnippet(combined);
+    if (found) {
+      const claimCity = normalizeEntityName(cap.city);
+      const foundCapital = normalizeEntityName(found.capital);
+      const claimCountry = normalizeEntityName(cap.country);
+      const foundCountry = normalizeEntityName(found.country || "");
+
+      const countryLooksSame =
+        !!claimCountry &&
+        !!foundCountry &&
+        (foundCountry.includes(claimCountry) || claimCountry.includes(foundCountry) || overlapCount(tokenSetFromText(claimCountry), tokenSetFromText(foundCountry)) >= 1);
+
+      if (countryLooksSame) {
+        if (foundCapital && claimCity && foundCapital !== claimCity) {
+          return { stance: "refute", relevance: 95, strength: 95, reason: "capital_mismatch", extracted: { capital: found.capital, country: found.country } };
+        }
+        if (foundCapital && claimCity && foundCapital === claimCity) {
+          return { stance: "support", relevance: 95, strength: 90, reason: "capital_match", extracted: { capital: found.capital, country: found.country } };
+        }
+      }
+    }
+
+    return { stance: "unknown", relevance: Math.max(relevance, 55), strength: 0, reason: "capital_unresolved", extracted: null };
+  }
+
+  // 2) Fallback: seulement si pertinent
+  const fallback = stanceFromText(combined);
+  if (relevance >= 60) return { stance: fallback, relevance, strength: fallback === "unknown" ? 0 : 55, reason: "fallback_keywords", extracted: null };
+
+  return { stance: "unknown", relevance, strength: 0, reason: "low_relevance", extracted: null };
+}
+
 
 // Requêtes PRO: max 3, ultra ciblées
 function buildProQueries(claim, lang) {
@@ -774,11 +933,11 @@ function buildProQueries(claim, lang) {
   return queries.slice(0, 3);
 }
 
-function scoreEvidenceBrutal(enrichedItems) {
+function scoreEvidenceBrutal(enrichedItems, verifiable) {
   const list = enrichedItems || [];
   if (list.length === 0) {
     return {
-      evidenceScore: 45,
+      evidenceScore: verifiable ? 40 : 45,
       confidence: 20,
       hasContradictions: false,
       strongRefute: false,
@@ -787,9 +946,14 @@ function scoreEvidenceBrutal(enrichedItems) {
     };
   }
 
-  // Stats
   const domains = new Set();
+
   let relSum = 0;
+  let relvSum = 0;
+
+  // Poids “contre le claim”
+  let supportW = 0;
+  let refuteW = 0;
 
   let support = 0;
   let refute = 0;
@@ -797,92 +961,93 @@ function scoreEvidenceBrutal(enrichedItems) {
 
   for (const it of list) {
     const rel = it.reliability || 50;
+    const relv = typeof it.relevance === "number" ? it.relevance : 50;
+
     relSum += rel;
+    relvSum += relv;
     if (it.domain) domains.add(it.domain);
 
     const stance = it.stance || "unknown";
     if (stance === "support") support++;
     else if (stance === "refute") refute++;
     else unknown++;
+
+    // Poids: qualité * pertinence (0..1.0)
+    const w = (Math.max(0, Math.min(100, rel)) / 100) * (Math.max(0, Math.min(100, relv)) / 100);
+
+    if (stance === "support") supportW += w;
+    else if (stance === "refute") refuteW += w;
   }
 
   const avgRel = relSum / Math.max(1, list.length);
+  const avgRelevance = relvSum / Math.max(1, list.length);
   const diversity = domains.size;
 
-  const hasContradictions = support > 0 && refute > 0;
+  const hasContradictions = supportW > 0.3 && refuteW > 0.3;
 
-  // “Forte contradiction” = refute domine + sources pas mauvaises
-  const strongRefute = refute >= Math.max(2, support + 1) && avgRel >= 70;
-  const strongSupport = support >= Math.max(2, refute + 1) && avgRel >= 70;
+  // “Forte” = poids largement dominant + un minimum de qualité/pertinence
+  const strongRefute =
+    refuteW >= Math.max(0.9, supportW * 2.0) && avgRel >= 65 && avgRelevance >= 55;
 
-  // Score evidence brut
+  const strongSupport =
+    supportW >= Math.max(0.9, refuteW * 2.0) && avgRel >= 65 && avgRelevance >= 55;
+
+  // Base
   let evidenceScore = 50;
 
-  // Qualité
-  if (avgRel >= 85) evidenceScore += 20;
-  else if (avgRel >= 70) evidenceScore += 12;
-  else evidenceScore += 6;
+  // 1) Pertinence d'abord
+  if (avgRelevance >= 80) evidenceScore += 10;
+  else if (avgRelevance >= 60) evidenceScore += 6;
+  else evidenceScore -= 8;
 
-  // Diversité
-  if (diversity >= 5) evidenceScore += 12;
-  else if (diversity >= 3) evidenceScore += 8;
-  else if (diversity >= 2) evidenceScore += 4;
+  // 2) Qualité (mais pas “cadeau”)
+  if (avgRel >= 85) evidenceScore += 10;
+  else if (avgRel >= 70) evidenceScore += 6;
+  else evidenceScore += 2;
 
-  // Pénalités
-  if (hasContradictions) evidenceScore -= 10;
+  // 3) Diversité (petit bonus)
+  if (diversity >= 5) evidenceScore += 6;
+  else if (diversity >= 3) evidenceScore += 4;
+  else if (diversity >= 2) evidenceScore += 2;
+
+  // 4) Direction (support vs refute)
+  const diff = supportW - refuteW;
+  evidenceScore += Math.round(diff * 25);
+
+  // Contradictions
+  if (hasContradictions) evidenceScore -= 8;
 
   // Verdict brutal
   if (strongRefute) evidenceScore = Math.min(evidenceScore, 12);
-  if (strongSupport) evidenceScore = Math.max(evidenceScore, 80);
-
-  evidenceScore = Math.max(0, Math.min(100, Math.round(evidenceScore)));
-
-  // Confiance
-  let confidence = 35;
-  confidence += Math.round((avgRel - 50) * 0.6);
-  confidence += Math.min(20, diversity * 4);
-  if (hasContradictions) confidence -= 10;
-  if (strongRefute || strongSupport) confidence += 10;
-  confidence = Math.max(0, Math.min(100, Math.round(confidence)));
+  if (strongSupport) evidenceScore = Math.max(evidenceScore, 82);
 
   const notes = [];
   if (hasContradictions) notes.push("mixed_signals");
   if (strongRefute) notes.push("strong_refutation");
   if (strongSupport) notes.push("strong_corroboration");
   if (avgRel >= 85) notes.push("high_quality_sources");
+  if (avgRelevance < 50) notes.push("low_relevance");
+
+  // Si vérifiable MAIS pas de verdict clair → prudence (retour “comme avant”)
+  if (verifiable && !strongSupport && !strongRefute) {
+    notes.push("no_clear_verdict");
+    evidenceScore = Math.min(evidenceScore, 55);
+  }
+
+  evidenceScore = Math.max(0, Math.min(100, Math.round(evidenceScore)));
+
+  // Confiance
+  let confidence = 35;
+  confidence += Math.round((avgRel - 50) * 0.5);
+  confidence += Math.round((avgRelevance - 50) * 0.4);
+  confidence += Math.min(18, diversity * 3);
+  if (hasContradictions) confidence -= 10;
+  if (strongRefute || strongSupport) confidence += 10;
+  confidence = Math.max(0, Math.min(100, Math.round(confidence)));
 
   return { evidenceScore, confidence, hasContradictions, strongRefute, strongSupport, notes };
 }
 
-function buildProExplanation(lang, claim, evidence, buckets) {
-  const l = (lang || "en").toLowerCase();
-  const fr = l.startsWith("fr");
-
-  const { strongRefute, strongSupport, hasContradictions, confidence } = evidence;
-
-  if (fr) {
-    if (strongRefute) {
-      return `Analyse des éléments disponibles : les sources consultées contredisent clairement l’affirmation (« ${claim} »). À ce stade, elle apparaît très probablement incorrecte. Niveau de confiance : ${confidence}/100. Limite : cette conclusion dépend des sources accessibles publiquement au moment de l’analyse.`;
-    }
-    if (strongSupport) {
-      return `Analyse des éléments disponibles : plusieurs sources fiables corroborent l’affirmation (« ${claim} »). À ce stade, elle apparaît probablement correcte. Niveau de confiance : ${confidence}/100. Limite : la qualité dépend des sources accessibles publiquement au moment de l’analyse.`;
-    }
-    if (hasContradictions) {
-      return `Analyse des éléments disponibles : les sources consultées présentent des signaux partagés autour de l’affirmation (« ${claim} »). À ce stade, prudence recommandée. Niveau de confiance : ${confidence}/100.`;
-    }
-    return `Analyse des éléments disponibles : les sources consultées apportent des éléments limités ou indirects sur l’affirmation (« ${claim} »). À ce stade, impossible de conclure solidement. Niveau de confiance : ${confidence}/100.`;
-  } else {
-    if (strongRefute) {
-      return `Evidence review: consulted sources clearly contradict the claim ("${claim}"). At this stage, it appears very likely incorrect. Confidence: ${confidence}/100. Limitation: depends on publicly available sources at analysis time.`;
-    }
-    if (strongSupport) {
-      return `Evidence review: multiple reliable sources corroborate the claim ("${claim}"). At this stage, it appears likely correct. Confidence: ${confidence}/100. Limitation: depends on publicly available sources at analysis time.`;
-    }
-    if (hasContradictions) {
-      return `Evidence review: consulted sources show mixed signals around the claim ("${claim}"). Caution is recommended. Confidence: ${confidence}/100.`;
-    }
-    return `Evidence review: consulted sources provide limited or indirect support regarding the claim ("${claim}"). No solid conclusion can be made. Confidence: ${confidence}/100.`;
-  }
 }
 
 async function runProEvidence(text, lang) {
@@ -963,14 +1128,15 @@ const claim = extractMainClaim(text);
     if (SIM_CACHE_MODE !== "off" && !isBorderline && fastDedup.length >= 8) break;
   }
 
-  const deduped = dedupeItems(allItems).slice(0, 10);
+     const deduped = dedupeItems(allItems).slice(0, 10);
   const enriched = deduped.map((it) => {
     const link = it.link || it.url || "";
     const domain = getDomain(link);
     const title = it.title || "";
     const snippet = it.snippet || it.description || "";
     const reliability = domainReliability(domain);
-    const stance = stanceFromText(`${title} ${snippet}`);
+
+    const cls = classifyItemAgainstClaim(claim, title, snippet, lang);
 
     return {
       title,
@@ -979,9 +1145,14 @@ const claim = extractMainClaim(text);
       snippet,
       domain,
       reliability,
-      stance,
+      stance: cls.stance,
+      relevance: cls.relevance,
+      strength: cls.strength,
+      stanceReason: cls.reason,
+      extracted: cls.extracted || null,
     };
   });
+
 
   // Buckets (wow)
   const buckets = { corroborates: [], contradicts: [], neutral: [] };

@@ -40,15 +40,6 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 
-    origin: function (origin, cb) {
-      if (originAllowed(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-ia11-key"],
-  })
-);
-
 app.options("/*", cors());
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path} origin=${req.headers.origin || "none"}`);

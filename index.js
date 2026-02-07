@@ -838,7 +838,6 @@ async function analyzeCore(req, { content, analysisType, language }) {
       finalScore = Math.min(finalScore, 25);
     }
 
-    );
 
     const l = (language || "en").toLowerCase();
     const fr = l.startsWith("fr");

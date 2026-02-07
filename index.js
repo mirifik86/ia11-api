@@ -12,10 +12,20 @@ app.use(express.json({ limit: "1mb" }));
 
 function originAllowed(origin) {
   if (!origin) return true;
+
+  // Lovable production + preview
   if (origin.includes("lovable.app")) return true;
+  if (origin.includes("lovable.dev")) return true;
+
+  // Lovable live preview panel domain (often *.object.com)
+  if (origin.includes("object.com")) return true;
+
+  // Your main domains
   if (origin.includes("leenscore.com")) return true;
+
   return false;
 }
+
 
 app.use(
   cors({

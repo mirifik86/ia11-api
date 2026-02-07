@@ -834,9 +834,10 @@ async function analyzeCore(req, { content, analysisType, language }) {
     );
 
     // If we detected a clear contradiction, cap hard (target 15–25).
-    if (reality?.contradiction) {
-      finalScore = Math.min(finalScore, 25);
+       if (reality?.contradiction) {
+      finalScore = Math.min(finalScore, 20);
     }
+
 
 
     const l = (language || "en").toLowerCase();

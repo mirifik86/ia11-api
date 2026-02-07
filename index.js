@@ -342,40 +342,35 @@ function labelFromScore(language, score) {
   return fr ? "Très douteux" : "Very dubious";
 }
 
-function computeStandard(text, language) {
-  const writingScore = computeWritingScore(text);
+  function computeStandard(text, language) {
   const l = (language || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
-  // score texte de base
-  let textScore = writingScore;
+  const clean = stripSpaces(text || "");
+  const claimToCheck = extractMainClaim(clean);
 
-  // cap -> éviter "faux/vrai", rester guide
-  let capApplied = false;
-  let capReason = "";
-
-  // if extreme claims patterns, lower the base
-  const t = safeLower(text);
-  if (/(100%|certain|preuve absolue|impossible|toujours|jamais)/i.test(t)) {
-    capApplied = true;
-    capReason = fr
-      ? "Formulations absolues détectées, prudence augmentée."
-      : "Absolute phrasing detected; increased caution.";
-    textScore = Math.max(35, textScore - 12);
-  }
-
-  const claimToCheck = extractMainClaim(text);
+  // -----------------------
+  // Option B (Standard)
+  // 60% Text (semi-intelligent) + 40% Web (1 Serper)
+  // Text score = average of 6 mini-scores (0..100)
+  // -----------------------
+  const subs = computeStandardTextSubscores(clean, fr);
+  const textScore = Math.round(
+    (subs.clarity + subs.nuance + subs.specificity + subs.tone + subs.coherence + subs.plausibility) / 6
+  );
 
   const summary = fr
-    ? "Analyse Standard : cohérence du texte + mini vérification web sur un point prioritaire."
-    : "Standard analysis: text coherence + a minimal web check on one key point.";
+    ? "Analyse Standard : score texte (60%) + mini vérification web (40%, 1 requête) sur un point testable."
+    : "Standard analysis: text score (60%) + minimal web check (40%, 1 query) on one testable point.";
 
   const bullets = {
-    whatWeDid: fr ? "Lecture rapide du style et de la prudence." : "Quick read of style and prudence.",
-    whatWeDid2: fr ? "Mini vérification web (1 requête) sur un claim prioritaire." : "Minimal web check (1 query) on a key claim.",
-    proTease: fr
-      ? "PRO : preuves + sources + explication complète."
-      : "PRO: evidence + sources + full explanation.",
+    whatWeDid: fr
+      ? "Score texte semi-intelligent (clarté, nuance, cohérence, plausibilité)."
+      : "Semi-intelligent text scoring (clarity, nuance, coherence, plausibility).",
+    whatWeDid2: fr
+      ? "Mini vérification web (1 requête) pour détecter contradiction / corroboration / neutre."
+      : "Minimal web check (1 query) to detect contradiction / corroboration / neutral.",
+    proTease: fr ? "PRO : preuves + sources + recoupement multi-sources." : "PRO: evidence + sources + multi-source cross-checking.",
   };
 
   return {
@@ -383,18 +378,78 @@ function computeStandard(text, language) {
     textScore,
     bullets,
     standard: {
-      writingScore,
-      capApplied,
-      capReason,
       claimToCheck,
+      claimStrength: subs.claimStrength, // 0..1
+      subscores: subs,
     },
+  };
+}
+
+function computeStandardTextSubscores(text, fr) {
+  const t = safeLower(text || "");
+  const claim = safeLower(extractMainClaim(text || ""));
+
+  // 1) Clarity: short, direct, and claim-like
+  let clarity = 55;
+  if (/\b(est|sont|is|are|was|were)\b/i.test(claim)) clarity += 10;
+  if (claim.length > 200) clarity -= 10;
+  if (claim.length < 18) clarity -= 8;
+  if (/\b(chose|stuff|truc|qqch|quelque chose)\b/i.test(claim)) clarity -= 8;
+
+  // 2) Nuance: hedges good, absolutes bad
+  const hedges = /(peut|pourrait|semble|souvent|parfois|probablement|selon|d'apr[eè]s|il est possible|might|may|seems|often|sometimes|likely|according to)/i;
+  const absolutes = /(100%|toujours|jamais|certain|preuve absolue|impossible|sans aucun doute|obviously|definitely|never|always|no doubt)/i;
+
+  let nuance = 55;
+  if (hedges.test(t)) nuance += 10;
+  if (absolutes.test(t)) nuance -= 18;
+
+  // 3) Specificity: dates, numbers, proper nouns
+  let specificity = 50;
+  if (/\b\d{2,}\b/.test(text)) specificity += 10;
+  if (/\b(19|20)\d{2}\b/.test(text)) specificity += 6;
+  if (/[A-ZÀ-ÖØ-Ý][a-zà-öø-ÿ]{3,}/.test(text)) specificity += 6;
+
+  // 4) Tone: emotional / sensational lowers credibility a bit
+  let tone = 60;
+  if (/(!{2,}|!!!|\b(scandale|choquant|honteux|incroyable|ridicule|arnaque|complot|shock|outrage|insane|scam|conspiracy)\b)/i.test(t)) {
+    tone -= 15;
+  }
+
+  // 5) Coherence: direct contradictions inside the text
+  let coherence = 60;
+  if (/\b(n'est pas|ne sont pas|is not|are not)\b/i.test(t) && /\b(est|sont|is|are)\b/i.test(t)) coherence -= 12;
+  if (/\b(mais|cependant|pourtant|however|but)\b/i.test(t) && claim.length < 40) coherence -= 5; // short claim with "but" often messy
+
+  // 6) Plausibility: light red flags (without pretending to be "truth")
+  let plausibility = 60;
+  if (/\b(pays nordique|nordic country|scandinave|scandinavian)\b/i.test(claim)) plausibility -= 8; // will be confirmed by web
+  if (/\b(la terre est plate|flat earth)\b/i.test(claim)) plausibility -= 20;
+
+  // Claim strength (0..1) used for caps if web contradicts
+  let claimStrength = 0.55;
+  if (/\b(est|is|are|was|were)\b/i.test(claim)) claimStrength += 0.15;
+  if (absolutes.test(t)) claimStrength += 0.20;
+  if (hedges.test(t)) claimStrength -= 0.20;
+  claimStrength = Math.max(0, Math.min(1, claimStrength));
+
+  // Clamp subscores 0..100
+  const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)));
+
+  return {
+    clarity: clamp(clarity),
+    nuance: clamp(nuance),
+    specificity: clamp(specificity),
+    tone: clamp(tone),
+    coherence: clamp(coherence),
+    plausibility: clamp(plausibility),
+    claimStrength,
   };
 }
 
 function extractMainClaim(text) {
   const t = stripSpaces(text);
   if (!t) return "";
-  // Take first sentence-ish
   const first = t.split(/[\.\n]/)[0];
   return stripSpaces(first).slice(0, 180);
 }
@@ -417,17 +472,17 @@ async function runStandardRealityCheck(text, language, claimHint) {
 
   try {
     if (!claim) {
-      return { used: false, realityScore: 55, verdict: null, checkedClaim: null, contradiction: false };
+      return { used: false, realityScore: 52, verdict: null, checkedClaim: null, contradiction: false, classification: "neutral" };
     }
 
-    // If Serper missing, be more conservative on verifiable claims (not “55”).
     if (!SERPER_KEY) {
       return {
         used: false,
-        realityScore: isVerifiable ? 45 : 55,
+        realityScore: isVerifiable ? 45 : 52,
         verdict: fr ? "Vérification web indisponible (clé manquante)." : "Web check unavailable (missing key).",
         checkedClaim: claim,
         contradiction: false,
+        classification: "neutral",
       };
     }
 
@@ -442,6 +497,7 @@ async function runStandardRealityCheck(text, language, claimHint) {
         verdict: fr ? "Mini vérif via cache." : "Mini check via cache.",
         checkedClaim: claim,
         contradiction: rr.contradiction,
+        classification: rr.classification,
       };
     }
 
@@ -449,10 +505,11 @@ async function runStandardRealityCheck(text, language, claimHint) {
     if (!sr.ok) {
       return {
         used: false,
-        realityScore: isVerifiable ? 45 : 55,
+        realityScore: isVerifiable ? 45 : 52,
         verdict: sr.error || null,
         checkedClaim: claim,
         contradiction: false,
+        classification: "neutral",
       };
     }
 
@@ -467,21 +524,23 @@ async function runStandardRealityCheck(text, language, claimHint) {
       verdict: fr ? "Mini vérification web effectuée (1 requête)." : "Minimal web check completed (1 query).",
       checkedClaim: claim,
       contradiction: rr.contradiction,
+      classification: rr.classification,
     };
   } catch (e) {
     return {
       used: false,
-      realityScore: isVerifiable ? 45 : 55,
+      realityScore: isVerifiable ? 45 : 52,
       verdict: e?.message || "error",
       checkedClaim: claim || null,
       contradiction: false,
+      classification: "neutral",
     };
   }
 }
 
 function estimateRealityFromSearch(items, fr, claim) {
   const list = Array.isArray(items) ? items : [];
-  if (!list.length) return { realityScore: 55, contradiction: false };
+  if (!list.length) return { realityScore: 52, contradiction: false, classification: "neutral" };
 
   const claimText = safeLower(stripSpaces(claim || ""));
   const blob = safeLower(
@@ -490,14 +549,17 @@ function estimateRealityFromSearch(items, fr, claim) {
       .join(" ")
   );
 
+  // Quick explicit "not true / false" signals
+  const explicitNo = /\b(not true|false|incorrect|myth|hoax|faux|incorrect|fausse|mythe)\b/i.test(blob);
+
   // Detect "X is a TYPE" / "X est une TYPE"
-  const m =
+  const mType =
     claimText.match(/(.+?)\s+est\s+une?\s+(plan[eè]te|pays|ville|continent|oc[eé]an)/i) ||
     claimText.match(/(.+?)\s+is\s+an?\s+(planet|country|city|continent|ocean)/i);
 
-  if (m) {
-    const rawSubject = stripSpaces(m[1] || "");
-    const rawType = safeLower(m[2] || "");
+  if (mType) {
+    const rawSubject = stripSpaces(mType[1] || "");
+    const rawType = safeLower(mType[2] || "");
 
     const subjectToken =
       safeLower(rawSubject)
@@ -515,18 +577,51 @@ function estimateRealityFromSearch(items, fr, claim) {
     const evSaysPlanet = mentionsSubject && /\b(planet|plan[eè]te|planete)\b/i.test(blob);
     const evSaysCity = mentionsSubject && /\b(city|ville)\b/i.test(blob);
 
-    // Strong contradictions → Standard must drop hard (15–25 target).
     if ((claimPlanet && evSaysCountry) || (claimCity && evSaysCountry) || (claimCountry && evSaysPlanet)) {
-      return { realityScore: 18, contradiction: true };
+      return { realityScore: 15, contradiction: true, classification: "contradiction" };
     }
 
-    // Corroboration (light)
     if ((claimCountry && evSaysCountry) || (claimPlanet && evSaysPlanet) || (claimCity && evSaysCity)) {
-      return { realityScore: 72, contradiction: false };
+      return { realityScore: 68, contradiction: false, classification: "corroboration" };
     }
   }
 
-  // No clear stance → light heuristic via trusted domains
+  // Detect "X is nordic/scandinavian" / "X est nordique"
+  const mNordic =
+    claimText.match(/(.+?)\s+est\s+un\s+pays\s+nordique/i) ||
+    claimText.match(/(.+?)\s+is\s+a\s+nordic\s+country/i) ||
+    claimText.match(/(.+?)\s+est\s+nordique/i) ||
+    claimText.match(/(.+?)\s+is\s+nordic/i) ||
+    claimText.match(/(.+?)\s+est\s+scandinave/i) ||
+    claimText.match(/(.+?)\s+is\s+scandinavian/i);
+
+  if (mNordic) {
+    const rawSubject = stripSpaces(mNordic[1] || "");
+    const subjectToken =
+      safeLower(rawSubject)
+        .split(/\s+/)
+        .filter((w) => w && !["le", "la", "les", "un", "une", "des", "du", "de", "the", "a", "an"].includes(w))
+        .sort((a, b) => b.length - a.length)[0] || safeLower(rawSubject);
+
+    const mentionsSubject = subjectToken && blob.includes(subjectToken);
+
+    const evNordic = mentionsSubject && /\b(nordic|scandinav|scandinave)\b/i.test(blob);
+    const evNA = mentionsSubject && /\b(north america|am[eé]rique du nord|latin america|am[eé]rique latine|central america|am[eé]rique centrale)\b/i.test(blob);
+    const evEurope = mentionsSubject && /\b(europe|europ[eé]en|europ[eé]enne|scandinavia|scandinavie)\b/i.test(blob);
+    const evNotNordic = mentionsSubject && /\b(not a nordic|not nordic|pas nordique|non nordique)\b/i.test(blob);
+
+    if (evNotNordic || (evNA && !evNordic && !evEurope) || explicitNo) {
+      return { realityScore: 12, contradiction: true, classification: "contradiction" };
+    }
+
+    if (evNordic || evEurope) {
+      return { realityScore: 66, contradiction: false, classification: "corroboration" };
+    }
+
+    return { realityScore: 52, contradiction: false, classification: "neutral" };
+  }
+
+  // No clear stance → light heuristic via trusted domains (neutral-ish, not too high)
   const trusted = [
     "wikipedia.org",
     "britannica.com",
@@ -547,9 +642,9 @@ function estimateRealityFromSearch(items, fr, claim) {
     if (trusted.includes(d)) trustHits++;
   }
 
-  if (trustHits >= 2) return { realityScore: 65, contradiction: false };
-  if (trustHits === 1) return { realityScore: 60, contradiction: false };
-  return { realityScore: 55, contradiction: false };
+  if (trustHits >= 2) return { realityScore: 58, contradiction: false, classification: "neutral" };
+  if (trustHits === 1) return { realityScore: 55, contradiction: false, classification: "neutral" };
+  return { realityScore: 52, contradiction: false, classification: "neutral" };
 }
 
 // =====================
@@ -813,31 +908,36 @@ async function analyzeCore(req, { content, analysisType, language }) {
   // STANDARD
   // -----------------------
   if (mode === "standard") {
-    const standardOut = computeStandard(text, language);
+        const standardOut = computeStandard(text, language);
 
-        // 1 mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
+    // 1 mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
     const claimToCheck = stripSpaces(standardOut?.standard?.claimToCheck || "");
     const isVerifiable = looksLikeVerifiableClaim(claimToCheck);
 
     const reality = await runStandardRealityCheck(text, language, claimToCheck);
-    const defaultReality = isVerifiable ? 45 : 55;
+    const defaultReality = isVerifiable ? 45 : 52;
     const realityScore = typeof reality?.realityScore === "number" ? reality.realityScore : defaultReality;
 
-    // Standard: if short + verifiable, reality matters MUCH more than writing style.
-    const textLen = stripSpaces(text).length;
-    const writingW = isVerifiable && textLen < 140 ? 0.25 : 0.7;
-    const realityW = 1 - writingW;
+    // Option B: fixed weights (60% text / 40% web)
+    const textW = 0.6;
+    const webW = 0.4;
 
     let finalScore = Math.max(
       0,
-      Math.min(100, Math.round(writingW * (standardOut.textScore || 0) + realityW * realityScore))
+      Math.min(100, Math.round(textW * (standardOut.textScore || 0) + webW * realityScore))
     );
 
-    // If we detected a clear contradiction, cap hard (target 15–25).
-       if (reality?.contradiction) {
-      finalScore = Math.min(finalScore, 20);
-    }
+    // Caps (asymmetric): contradiction must hit hard
+    const claimStrength = typeof standardOut?.standard?.claimStrength === "number" ? standardOut.standard.claimStrength : 0.55;
 
+    if (reality?.classification === "contradiction" || reality?.contradiction) {
+      // Base cap if contradiction
+      let cap = 40;
+      // Strong, assertive claim + contradiction => stronger cap
+      if (claimStrength >= 0.7) cap = 30;
+      if (claimStrength >= 0.85) cap = 25;
+      finalScore = Math.min(finalScore, cap);
+    }
 
 
     const l = (language || "en").toLowerCase();
@@ -852,7 +952,8 @@ async function analyzeCore(req, { content, analysisType, language }) {
     const breakdown = {
       sources: { points: 0, reason: fr ? "Standard : pas de liens affichés (tease PRO)." : "Standard: no links displayed (PRO tease)." },
       factual: { points: Math.round(realityScore), reason: reality?.verdict || "" },
-      tone: { points: Math.round(standardOut?.standard?.writingScore ?? standardOut?.textScore ?? 50), reason: fr ? "Qualité d'écriture et prudence." : "Writing quality and prudence." },
+      tone: { points: Math.round(standardOut?.standard?.subscores?.tone ?? standardOut?.textScore ?? 50), reason: fr ? "Qualité d'écriture et prudence." : "Writing quality and prudence." },
+
       context: { points: 55, reason: fr ? "Contexte limité sans lecture d'article complet." : "Limited context without full-article reading." },
       transparency: { points: 60, reason: fr ? "Guide de crédibilité, pas un verdict absolu." : "Credibility guidance, not an absolute verdict." },
     };
@@ -872,14 +973,15 @@ async function analyzeCore(req, { content, analysisType, language }) {
           textScore: standardOut.textScore,
           realityScore,
           bullets: standardOut.bullets,
-          details: {
-            writingScore: standardOut?.standard?.writingScore,
-            capApplied: standardOut?.standard?.capApplied,
-            capReason: standardOut?.standard?.capReason,
+           details: {
             claimChecked: reality?.checkedClaim || standardOut?.standard?.claimToCheck || null,
+            webClassification: reality?.classification || (reality?.contradiction ? "contradiction" : "neutral"),
+            claimStrength: standardOut?.standard?.claimStrength ?? 0.55,
+            subscores: standardOut?.standard?.subscores || null,
             realityVerdict: reality?.verdict || null,
             realityUsed: !!reality?.used,
           },
+
         },
       },
     };

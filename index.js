@@ -40,20 +40,6 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 
-app.options("/*", cors());
-app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path} origin=${req.headers.origin || "none"}`);
-  next();
-});
-
-// FETCH SAFE
-const _fetch = global.fetch;
-if (typeof _fetch !== "function") {
-  console.error("Global fetch missing. Use Node 18+ on Render.");
-  process.exit(1);
-}
-
-// ENV
 const IA11_KEY = process.env.IA11_API_KEY;
 const SERPER_KEY = process.env.SERPER_API_KEY;
 const HTTP_TIMEOUT_MS = Number.parseInt(process.env.HTTP_TIMEOUT_MS || "8000", 10);

@@ -10,30 +10,14 @@ app.set("trust proxy", 1);
 
 app.use(express.json({ limit: "1mb" }));
 
-function originAllowed(origin) {
-  if (!origin) return true;
-
-  // Lovable (prod + dev)
-  if (origin.includes("lovable.app")) return true;
-  if (origin.includes("lovable.dev")) return true;
-
-  // Lovable preview panels (often *.object.com)
-  if (origin.includes("object.com")) return true;
-
-  // Your domain
-  if (origin.includes("leenscore.com")) return true;
-
-  return false;
-}
-
+// ✅ TEMP FIX: allow CORS from anywhere so the app can work.
+// Once everything works, we will lock it down again.
 const corsOptions = {
-  origin: function (origin, cb) {
-    // IMPORTANT: never throw an Error here (it causes preflight 500 in browsers)
-    if (originAllowed(origin)) return cb(null, true);
-    return cb(null, false);
-  },
+  origin: true, // reflects request origin
+  credentials: true,
   methods: ["GET", "POST", "OPTIONS"],
- 
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
 };
 
 app.use(cors(corsOptions));

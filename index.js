@@ -408,41 +408,40 @@ function looksLikeVerifiableClaim(claim) {
 }
 
 async function runStandardRealityCheck(text, language, claimHint) {
-  // Standard should stay cheap: 0 or 1 Serper query max.
+  // Standard = cheap: 0 or 1 Serper query max.
   const l = (language || "en").toLowerCase();
   const fr = l.startsWith("fr");
 
-  // Always compute the claim first so our fallback can be smarter than “55”.
   const claim = stripSpaces(claimHint || extractMainClaim(text));
   const isVerifiable = looksLikeVerifiableClaim(claim);
 
   try {
     if (!claim) {
-      return { used: false, realityScore: 55, verdict: null, checkedClaim: null };
+      return { used: false, realityScore: 55, verdict: null, checkedClaim: null, contradiction: false };
     }
 
-    // If Serper is not configured, be slightly more conservative on verifiable claims.
+    // If Serper missing, be more conservative on verifiable claims (not “55”).
     if (!SERPER_KEY) {
       return {
         used: false,
         realityScore: isVerifiable ? 45 : 55,
-        verdict: fr
-          ? "Vérification web indisponible (clé manquante)."
-          : "Web check unavailable (missing key).",
+        verdict: fr ? "Vérification web indisponible (clé manquante)." : "Web check unavailable (missing key).",
         checkedClaim: claim,
+        contradiction: false,
       };
     }
 
     // CACHED? exact or similar
     const cached = getCachedSerperSimilar(claim, l);
     if (cached) {
-      const realityScore = estimateRealityFromSearch(cached, fr, claim);
+      const rr = estimateRealityFromSearch(cached, fr, claim);
       return {
         used: true,
         fromCache: true,
-        realityScore,
+        realityScore: rr.realityScore,
         verdict: fr ? "Mini vérif via cache." : "Mini check via cache.",
         checkedClaim: claim,
+        contradiction: rr.contradiction,
       };
     }
 
@@ -453,21 +452,21 @@ async function runStandardRealityCheck(text, language, claimHint) {
         realityScore: isVerifiable ? 45 : 55,
         verdict: sr.error || null,
         checkedClaim: claim,
+        contradiction: false,
       };
     }
 
     setCachedSerper(claim, l, sr.items);
 
-    const realityScore = estimateRealityFromSearch(sr.items, fr, claim);
+    const rr = estimateRealityFromSearch(sr.items, fr, claim);
 
     return {
       used: true,
       fromCache: false,
-      realityScore,
-      verdict: fr
-        ? "Mini vérification web effectuée (1 requête)."
-        : "Minimal web check completed (1 query).",
+      realityScore: rr.realityScore,
+      verdict: fr ? "Mini vérification web effectuée (1 requête)." : "Minimal web check completed (1 query).",
       checkedClaim: claim,
+      contradiction: rr.contradiction,
     };
   } catch (e) {
     return {
@@ -475,70 +474,59 @@ async function runStandardRealityCheck(text, language, claimHint) {
       realityScore: isVerifiable ? 45 : 55,
       verdict: e?.message || "error",
       checkedClaim: claim || null,
+      contradiction: false,
     };
   }
 }
 
 function estimateRealityFromSearch(items, fr, claim) {
   const list = Array.isArray(items) ? items : [];
-  if (!list.length) return 55;
+  if (!list.length) return { realityScore: 55, contradiction: false };
 
-  const claimText = safeLower(claim || "");
+  const claimText = safeLower(stripSpaces(claim || ""));
   const blob = safeLower(
     list
       .map((it) => `${it.title || ""} ${it.snippet || it.description || ""} ${it.link || it.url || ""}`)
       .join(" ")
   );
 
-  // ---------
-  // OPTION A: contradiction detection (cheap heuristic)
-  // Example: "Le Canada est une planète" should crash realityScore.
-  // ---------
-  const typeMatch =
+  // Detect "X is a TYPE" / "X est une TYPE"
+  const m =
     claimText.match(/(.+?)\s+est\s+une?\s+(plan[eè]te|pays|ville|continent|oc[eé]an)/i) ||
     claimText.match(/(.+?)\s+is\s+an?\s+(planet|country|city|continent|ocean)/i);
 
-  if (typeMatch) {
-    const rawSubject = stripSpaces(typeMatch[1] || "");
-    const rawType = safeLower(typeMatch[2] || "");
+  if (m) {
+    const rawSubject = stripSpaces(m[1] || "");
+    const rawType = safeLower(m[2] || "");
 
-    // pick a stable subject token (avoid articles)
     const subjectToken =
       safeLower(rawSubject)
         .split(/\s+/)
         .filter((w) => w && !["le", "la", "les", "un", "une", "des", "du", "de", "the", "a", "an"].includes(w))
         .sort((a, b) => b.length - a.length)[0] || safeLower(rawSubject);
 
-    const evidenceMentionsSubject = subjectToken && blob.includes(subjectToken);
+    const mentionsSubject = subjectToken && blob.includes(subjectToken);
 
-    // Contradiction rules (minimal, targeted)
-    const isPlanetClaim = ["planet", "planète", "planete"].includes(rawType);
-    const isCountryClaim = ["country", "pays"].includes(rawType);
-    const isCityClaim = ["city", "ville"].includes(rawType);
+    const claimPlanet = ["planet", "planète", "planete"].includes(rawType);
+    const claimCountry = ["country", "pays"].includes(rawType);
+    const claimCity = ["city", "ville"].includes(rawType);
 
-    const evidenceSaysCountry =
-      /\b(country|pays|nation|state)\b/i.test(blob) && evidenceMentionsSubject;
-    const evidenceSaysPlanet = /\b(planet|plan[eè]te|planete)\b/i.test(blob) && evidenceMentionsSubject;
+    const evSaysCountry = mentionsSubject && /\b(country|pays|nation|state)\b/i.test(blob);
+    const evSaysPlanet = mentionsSubject && /\b(planet|plan[eè]te|planete)\b/i.test(blob);
+    const evSaysCity = mentionsSubject && /\b(city|ville)\b/i.test(blob);
 
-    // If claim is “planet” but evidence clearly frames it as a country → very low.
-    if (isPlanetClaim && evidenceSaysCountry) {
-      return 18;
+    // Strong contradictions → Standard must drop hard (15–25 target).
+    if ((claimPlanet && evSaysCountry) || (claimCity && evSaysCountry) || (claimCountry && evSaysPlanet)) {
+      return { realityScore: 18, contradiction: true };
     }
 
-    // If claim is “city” but evidence clearly frames it as a country → low.
-    if (isCityClaim && evidenceSaysCountry) {
-      return 25;
-    }
-
-    // If claim is “country” but evidence frames it as a planet → low (rare, but symmetric).
-    if (isCountryClaim && evidenceSaysPlanet) {
-      return 25;
+    // Corroboration (light)
+    if ((claimCountry && evSaysCountry) || (claimPlanet && evSaysPlanet) || (claimCity && evSaysCity)) {
+      return { realityScore: 72, contradiction: false };
     }
   }
 
-  // ---------
-  // Existing trust heuristic
-  // ---------
+  // No clear stance → light heuristic via trusted domains
   const trusted = [
     "wikipedia.org",
     "britannica.com",
@@ -559,9 +547,9 @@ function estimateRealityFromSearch(items, fr, claim) {
     if (trusted.includes(d)) trustHits++;
   }
 
-  if (trustHits >= 2) return 70;
-  if (trustHits === 1) return 63;
-  return 55;
+  if (trustHits >= 2) return { realityScore: 65, contradiction: false };
+  if (trustHits === 1) return { realityScore: 60, contradiction: false };
+  return { realityScore: 55, contradiction: false };
 }
 
 // =====================
@@ -827,7 +815,7 @@ async function analyzeCore(req, { content, analysisType, language }) {
   if (mode === "standard") {
     const standardOut = computeStandard(text, language);
 
-       // 1 mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
+        // 1 mini check Serper sur 1 claim prioritaire (sans afficher de sources à l'utilisateur)
     const claimToCheck = stripSpaces(standardOut?.standard?.claimToCheck || "");
     const isVerifiable = looksLikeVerifiableClaim(claimToCheck);
 
@@ -835,17 +823,21 @@ async function analyzeCore(req, { content, analysisType, language }) {
     const defaultReality = isVerifiable ? 45 : 55;
     const realityScore = typeof reality?.realityScore === "number" ? reality.realityScore : defaultReality;
 
-    // Small slice of Option B: if it's a short, verifiable claim, reality matters more than writing style.
+    // Standard: if short + verifiable, reality matters MUCH more than writing style.
     const textLen = stripSpaces(text).length;
-    const writingW = isVerifiable && textLen < 140 ? 0.4 : 0.7;
+    const writingW = isVerifiable && textLen < 140 ? 0.25 : 0.7;
     const realityW = 1 - writingW;
 
-    const finalScore = Math.max(
+    let finalScore = Math.max(
       0,
-      Math.min(
-        100,
-        Math.round(writingW * (standardOut.textScore || 0) + realityW * realityScore)
-      )
+      Math.min(100, Math.round(writingW * (standardOut.textScore || 0) + realityW * realityScore))
+    );
+
+    // If we detected a clear contradiction, cap hard (target 15–25).
+    if (reality?.contradiction) {
+      finalScore = Math.min(finalScore, 25);
+    }
+
     );
 
     const l = (language || "en").toLowerCase();

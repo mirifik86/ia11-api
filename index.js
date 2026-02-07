@@ -33,7 +33,7 @@ const corsOptions = {
     return cb(null, false);
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-ia11-key"],
+ 
 };
 
 app.use(cors(corsOptions));

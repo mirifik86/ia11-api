@@ -13,22 +13,32 @@ app.use(express.json({ limit: "1mb" }));
 function originAllowed(origin) {
   if (!origin) return true;
 
-  // Lovable production + preview
+  // Lovable (prod + dev)
   if (origin.includes("lovable.app")) return true;
   if (origin.includes("lovable.dev")) return true;
 
-  // Lovable live preview panel domain (often *.object.com)
+  // Lovable preview panels (often *.object.com)
   if (origin.includes("object.com")) return true;
 
-  // Your main domains
+  // Your domain
   if (origin.includes("leenscore.com")) return true;
 
   return false;
 }
 
+const corsOptions = {
+  origin: function (origin, cb) {
+    // IMPORTANT: do NOT throw an error here (it causes preflight 500 on browsers)
+    if (originAllowed(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-ia11-key"],
+};
 
-app.use(
-  cors({
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
     origin: function (origin, cb) {
       if (originAllowed(origin)) return cb(null, true);
       return cb(new Error("Not allowed by CORS"));

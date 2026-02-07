@@ -28,7 +28,7 @@ function originAllowed(origin) {
 
 const corsOptions = {
   origin: function (origin, cb) {
-    // IMPORTANT: do NOT throw an error here (it causes preflight 500 on browsers)
+    // IMPORTANT: never throw an Error here (it causes preflight 500 in browsers)
     if (originAllowed(origin)) return cb(null, true);
     return cb(null, false);
   },
@@ -38,6 +38,7 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
+
 
     origin: function (origin, cb) {
       if (originAllowed(origin)) return cb(null, true);
